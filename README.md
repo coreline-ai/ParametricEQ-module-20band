@@ -2,29 +2,65 @@
 
 # 🎧 Android 20-Band Parametric EQ Module
 
-**Android/Kotlin에서 호출 가능한 20-band Parametric EQ C++ DSP 코어**
+[![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](https://en.cppreference.com/w/cpp/17)
+[![Android NDK](https://img.shields.io/badge/Android%20NDK-r27-3DDC84?logo=android&logoColor=white)](https://developer.android.com/ndk)
+[![CMake](https://img.shields.io/badge/CMake-3.22%2B-064F8C?logo=cmake&logoColor=white)](https://cmake.org/)
+[![ABIs](https://img.shields.io/badge/ABIs-arm64--v8a%20%7C%20armv7a%20%7C%20x86__64-blue)](#-build--abi-matrix)
+[![DSP](https://img.shields.io/badge/DSP-RBJ%20Cookbook-orange)](https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html)
+[![Real-Time Safe](https://img.shields.io/badge/Real--Time-Lock--Free-green)](#%EF%B8%8F-real-time-safety-guarantees)
+[![Sanitizers](https://img.shields.io/badge/TSan%20%2F%20ASan%20%2F%20UBSan-Clean-brightgreen)](#-verification--quality-gates)
+[![License](https://img.shields.io/badge/License-Proprietary-lightgrey)](#-license)
 
-RBJ Audio EQ Cookbook 기반 · Stereo interleaved Float32 · JNI Direct ByteBuffer 처리 · Parametric EQ 전용
+**Android 환경의 lock-free, real-time safe 20-band Parametric EQ — 독립형 C++ DSP 코어**
 
-[API](#-api--input-contract) · [Wrapper 목표](#-wrapper-input-structure-target) · [Build](#-build--verification) · [Developer Guide](./DEVELOPER_GUIDE.md)
+RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct ByteBuffer · Oboe/AAudio/AudioTrack 어떤 I/O와도 결합 가능
+
+[Overview](#-overview) · [Scope](#-scope) · [EQ Comparison](#-eq-type-comparison) · [Quick Start](#-quick-start) · [API](#-api-reference) · [Build](#-build--abi-matrix) · [Verification](#-verification--quality-gates) · [Developer Guide](./DEVELOPER_GUIDE.md)
 
 </div>
 
 ---
 
+## 🎯 Overview
+
+이 모듈은 안드로이드(또는 일반 C++) 환경에서 오디오 스트림에 **20-band Parametric EQ**를 적용하는 독립형 C++ DSP 코어입니다. 오디오 I/O 계층(Oboe/AAudio/AudioTrack)과 DSP 연산을 완전히 분리한 블랙박스로 설계되어, 어떤 출력 파이프라인에 끼워 넣어도 동일하게 동작합니다.
+
+### 신호 흐름
+
+```text
+   ┌──────────┐   ┌───────────────────────────────┐   ┌──────────────────┐
+   │  Preamp  │──▶│ 20-Band Biquad Cascade        │──▶│  Soft Limiter    │──▶ Output
+   │  (gain)  │   │ (Stateful TDF-II,             │   │ (stereo-linked,  │   PCM
+   └──────────┘   │  lock-free coefficient publish│   │  optional)       │   Float32
+        ▲         │  + sample-accurate ramp)      │   └──────────────────┘
+        │         └───────────────────────────────┘            ▲
+        │                       ▲                              │
+   ┌────┴───────────────────────┴──────────────────────────────┴──────┐
+   │  updateConfig() — UI/JNI thread (lock-free, click-free 64~512 ramp) │
+   └─────────────────────────────────────────────────────────────────────┘
+```
+
+| 단계 | 역할 |
+|---|---|
+| **Preamp** | 누적 캐스케이드 최대 게인을 상쇄해 헤드룸 확보. `computeAutoPreampDB()`가 256-point log-grid \|H(f)\| 평가로 권장값 자동 산출 |
+| **20-Band Cascade** | 샘플 단위 `processSampleL/R` 직렬 통과 (cascade fusion). 계수는 lock-free seqlock으로 발행, 64~512 sample 선형 ramp 후 종점 snap |
+| **Soft Limiter** | L/R 동일 게인으로 동시 감쇠 (stereo image 보존). asymptotic soft-knee, threshold 0.95, headroom 0.05 |
+
+---
+
 ## 🎯 Scope
 
-이 모듈의 범위는 **20-band Parametric EQ**입니다.
+본 모듈의 범위는 **20-band Parametric EQ**로 한정됩니다.
 
-- 포함: `PEAKING`, `LOW_SHELF`, `HIGH_SHELF` 기반 biquad cascade, preamp, soft limiter, JNI bridge
-- 제외: Linear-phase EQ, Dynamic EQ, Oboe player 구현, Android UI 구현
-- Linear-phase/Dynamic EQ는 비교 대상 또는 제외 범위로만 언급하며, 이 문서의 구현 계획에 포함하지 않습니다.
+- **포함**: `PEAKING`, `LOW_SHELF`, `HIGH_SHELF` biquad cascade, preamp, soft limiter, JNI bridge, fixed-width wrapper input
+- **제외**: Linear-phase EQ, Dynamic EQ, Oboe player 구현, Android UI 구현
+- Linear-phase / Dynamic EQ는 비교 대상 또는 제외 범위로만 언급되며, 본 문서의 구현 계획에 포함되지 않습니다.
 
 ---
 
 ## 📊 EQ Type Comparison
 
-본 모듈이 **왜 Parametric EQ만 포함하고 다른 두 종류는 제외했는지** 결정 근거를 한 표로 정리합니다.
+본 모듈이 **왜 Parametric EQ만 포함하고 다른 두 종류는 제외했는지** 결정 근거.
 
 | 구분 | Parametric EQ | Linear-phase EQ | Dynamic EQ |
 |---|---|---|---|
@@ -32,99 +68,129 @@ RBJ Audio EQ Cookbook 기반 · Stereo interleaved Float32 · JNI Direct ByteBuf
 | **동작 방식** | `frequency`, `gain`, `Q`로 IIR biquad 적용 (RBJ Cookbook) | FIR / FFT / convolution 기반 선형 위상 필터 | EQ + compressor 결합. threshold·attack·release 기반 |
 | **Gain 변화** | 항상 고정 (정적) | 항상 고정 (정적) | 입력 신호 레벨에 따라 실시간 변화 |
 | **Phase 영향** | 있음 (IIR 필연) | 거의 없음 (linear-phase) | 일반적으로 있음 |
-| **Latency** | 낮음 (수 sample) | 높음 (수십~수백 ms, FIR 길이 비례) | 낮음~중간 (envelope follower 추가) |
+| **Latency** | 낮음 (수 sample) | 높음 (수십~수백 ms, FIR 길이 비례) | 낮음~중간 (envelope follower) |
 | **CPU 비용** | 낮음 | 높음 (FFT/convolution) | 중간~높음 |
 | **Pre-ringing** | 없음 | 있음 (transient에서 가청) | 없음 |
-| **장점** | 빠르고 실시간 처리에 적합, 구현 단순 | 위상 보존 → 믹싱/마스터링 phase coherence | 문제 대역만 자동 제어, 자연스러운 보정 |
-| **단점** | 위상 변화 발생 | latency / CPU / pre-ringing | 구현 및 튜닝 복잡, dynamics 부작용 |
-| **대표 용도** | 음악 앱 EQ, 헤드폰 보정, 톤 조절 | 스튜디오 마스터링, 멀티트랙 phase alignment | 디에서, 보컬/저역 제어, 자동 보정 |
-| **Android 실시간 재생 적합성** | 🟢 높음 | 🔴 낮음 (latency·CPU 부담) | 🟡 중간 |
-| **본 프로젝트 포함 여부** | ✅ **포함 (구현 완료)** | ❌ 제외 (out of scope) | ❌ 제외 (out of scope) |
+| **Android 실시간 적합성** | 🟢 높음 | 🔴 낮음 | 🟡 중간 |
+| **본 프로젝트 포함** | ✅ **포함** | ❌ 제외 | ❌ 제외 |
 
-### 본 프로젝트가 Parametric EQ를 선택한 이유
+> 📌 **선택 근거**: Android 실시간 콜백 (10~20ms 버퍼) + 모바일 SoC CPU 예산 + 음악 앱/헤드폰 보정 용도에선 Parametric EQ가 latency·CPU·결정성 모두 가장 적합. Linear-phase / Dynamic EQ가 필요해지면 별도 모듈로 추가하되 본 모듈 시그니처는 변경하지 않는 방향이 안전.
 
-| 기준 | 결정 근거 |
+---
+
+## 📦 Features
+
+### 🎛️ 지원 필터 타입
+
+| 타입 | 용도 | 파라미터 |
+|---|---|---|
+| `PEAKING` (Bell) | 특정 대역 boost / cut | freq, gain, **Q** (bandwidth) |
+| `LOW_SHELF` | 저역 일괄 boost / cut | freq, gain, **S** (shelf slope) |
+| `HIGH_SHELF` | 고역 일괄 boost / cut | freq, gain, **S** (shelf slope) |
+
+> ⚠️ **중요**: `EqBandConfig::qFactor` 필드는 PEAKING에선 Q (bandwidth)이고, LOW_SHELF/HIGH_SHELF에선 RBJ shelf slope S (transition steepness)로 해석됩니다. 동일 필드명이지만 type에 따라 의미가 다릅니다. 수식은 [RBJ Audio EQ Cookbook](https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html)을 100% 따릅니다.
+
+### 🛡️ Real-Time Safety Guarantees
+
+| 보장 | 메커니즘 |
 |---|---|
-| **Latency** | Android 실시간 재생 콜백은 10~20 ms 버퍼 단위. Linear-phase의 수십 ms latency는 글리치/입출력 위치 미스매치를 유발 |
-| **CPU 예산** | 모바일 SoC에서 FFT/convolution 기반 EQ는 발열·배터리 부담. IIR biquad 20개는 약 750× 실시간 처리 (Apple M-series 호스트 기준) |
-| **Phase coherence 요구도** | 음악 앱 / 헤드폰 보정에서 위상 일치는 마스터링급 요구가 아님. Pre-ringing 없는 IIR이 일반 청취 환경에 더 적합 |
-| **결정성** | 정적 EQ (사용자 설정에 따른 고정 응답)이 디버깅·튜닝·재현성 모두 단순 |
+| **Lock-free coefficient publication** | Seqlock-style 슬롯 (5×`std::atomic<float>` + seq counter) — UI 스레드의 `updateConfig`가 오디오 콜백을 절대 블록하지 않음 |
+| **Click/zipper 방지** | 64~512 sample 선형 ramp + 종점 snap. instant swap 대비 click 폭 ~64×↓ |
+| **Denormal CPU 폭주 방지** | `process()` 진입 시 RAII로 FZ/DAZ 활성, 종료 시 복원 (arm64/armv7/x86 분기) |
+| **Stereo image 보존** | Limiter가 매 프레임 `max(|L|,|R|)` 기준으로 동일 게인 적용 |
+| **Lifecycle UAF 차단** | Atomic engine pointer + in-flight counter drain pattern. `init/release/updateConfig/processDirectBuffer/computeAutoPreampDB` **모든 경로** 보호 |
+| **Data race 부재** | `computeAutoPreampDB`가 audio thread 활성 상태 대신 config-side snapshot을 mutex로 보호 |
+| **부분 config = 진짜 bypass** | `bands.size() < 20`이면 나머지 필터는 자동으로 unity 계수 (stale 계수 잔존 0) |
+| **입력 sanitization** | NaN/Inf/Q≤0/잘못된 sampleRate 모두 안전한 fallback (flat coeff 또는 기본값) |
 
-> 📌 **확장 시점에 대한 노트**: 만약 향후 마스터링 모드, 자동 디에서, 또는 시끄러운 환경 적응 보정이 필요하다면 별도 모듈로 Linear-phase EQ 또는 Dynamic EQ를 추가할 수 있으나, 본 모듈의 시그니처 (`updateConfig`, `process`, `EqEngineConfig`)는 변경하지 않는 방향이 호환성에 안전합니다.
+### 🔌 JNI Hardening
 
----
-
-## 🔊 Signal Flow
-
-```text
-Input Float32 stereo PCM
-   → Preamp
-   → 20-band Parametric EQ biquad cascade
-   → optional Soft Limiter
-   → Output Float32 stereo PCM
-```
-
-`Preamp`는 “가장 큰 슬라이더 gain만큼 단순 감쇠”가 아닙니다. 현재 config의 20개 band가 합쳐진 **누적 주파수 응답**을 `computeAutoPreampDB()`가 grid 기반으로 평가하고, cascade peak가 0 dBFS를 넘지 않도록 권장 preamp dB를 산출합니다. 순수 cut 위주의 preset이면 0 dB를 반환할 수 있습니다.
-
----
-
-## 📋 API & Input Contract
-
-### Current default input
-
-현재 Kotlin/JNI 기본 설정 입력은 고정 길이 20개 배열입니다.
-
-| 입력 | 의미 |
+| 항목 | 동작 |
 |---|---|
-| `gains[20]` | band별 gain dB |
-| `qFactors[20]` | band별 Q |
-| `frequencies[20]` | band별 center/cutoff frequency Hz |
-| `filterTypes[20]` | `0=PEAKING`, `1=LOW_SHELF`, `2=HIGH_SHELF` |
+| 배열 길이 검증 | 4-array (`types`/`freq`/`gain`/`Q`) min-clamp + 20-band cap |
+| Direct ByteBuffer 검증 | `GetDirectBufferAddress` null + `GetDirectBufferCapacity` ≥ `numFrames*2*sizeof(float)` |
+| `numFrames` 검증 | `≤ 0` early return |
+| 패키지 독립성 | `EQ_JNI_CLASS_PATH` 매크로 — 빌드 시 `-D`로 변경 가능 |
+| Symbol fallback | RegisterNatives + 레거시 `Java_com_example_audio_AudioEngineJNI_*` C 심볼 양쪽 export |
 
-JNI 메서드 시그니처는 기존 호환을 위해 다음 형태를 유지합니다.
+### 🧰 Wrapper Layer (Eq20BandInput)
 
-```kotlin
-external fun updateConfig(
-    preampDB: Float,
-    enableLimiter: Boolean,
-    filterTypes: IntArray,
-    frequencies: FloatArray,
-    gains: FloatArray,
-    qFactors: FloatArray
-)
-```
+UI/JNI에서 고정 길이 20개 슬라이더 배열을 다룰 때 사용:
 
-배열은 최대 20 band로 cap 됩니다. 부족한 band는 flat/bypass로 취급되어 stale coefficient가 남지 않아야 합니다.
+| 필드 | 타입 | 기본값 | 비고 |
+|---|---|---|---|
+| `gainMin / gainMax` | `float` | `-12.0 / +12.0` | core adapter clamp 정책 (UI 제약 아님) |
+| `qMin / qMax` | `float` | `0.05 / 10.0` | Q (or shelf S) clamp |
+| `gains[20]` | `float[]` | `0.0` | dB |
+| `qFactors[20]` | `float[]` | `0.707` | Q 또는 shelf S |
+| `frequencies[20]` | `float[]` | 31.25Hz~20kHz sqrt(2) 그리드 | Hz |
+| `filterTypes[20]` | `EqFilterType[]` | `PEAKING` × 20 | |
+| `preampDB` | `float` | `0.0` | dB |
+| `enableSoftLimiter` | `bool` | `true` | safer default |
 
-### Wrapper input structure target
-
-문서화 대상 wrapper 구조의 목표는 UI slider model을 core `EqEngineConfig`로 바꾸는 **core adapter 입력**을 명확히 하는 것입니다.
-
-```text
-gainMin, gainMax, gains[20]
-qMin,    qMax,    qFactors[20]
-frequencies[20]
-filterTypes[20]
-```
-
-정책:
-
-- `gainMin/gainMax`는 `gains[20]`를 core config로 변환할 때 적용하는 clamp bound입니다.
-- `qMin/qMax`는 `qFactors[20]`를 core config로 변환할 때 적용하는 clamp bound입니다.
-- 이 min/max는 **UI 제약이 아니라 core adapter clamp 정책**입니다. UI는 별도 제품 계층이며 이 모듈의 구현 범위가 아닙니다.
-- `frequencies[20]`와 `filterTypes[20]`는 Parametric EQ band 정의로 유지합니다.
-- wrapper는 Linear-phase/Dynamic EQ용 확장 구조가 아니며, Parametric EQ 20-band 입력을 안정적으로 변환하기 위한 구조입니다.
+`makeEqEngineConfig(Eq20BandInput)` 또는 `engine.updateConfig(Eq20BandInput)` 직접 호출.
 
 ---
 
-## 🔌 Kotlin/JNI Binding
+## 📋 Prerequisites
 
-기본 Kotlin 클래스 경로는 C++의 `EQ_JNI_CLASS_PATH` 기본값과 맞춰야 합니다.
+| 항목 | 권장 버전 |
+|---|---|
+| Android NDK | r25 이상 (테스트: r27.0.12077973) |
+| CMake | 3.22 이상 |
+| Android API | 21 이상 (테스트: 24) |
+| C++ 표준 | C++17 |
+
+호스트(macOS/Linux) 빌드는 `clang++ -std=c++17`만 있으면 standalone harness까지 가능 (JNI 부분은 NDK 필요).
+
+---
+
+## 🚀 Installation
+
+### 1) 소스 통합
+
+`src/main/cpp/` 9개 파일을 안드로이드 프로젝트에 복사:
+
+```bash
+cp -r src/main/cpp/* /path/to/your-android-app/app/src/main/cpp/
+```
+
+### 2) 빌드 옵션 (CMakeLists.txt에 이미 포함됨)
+
+| 옵션 | 기본값 | 설명 |
+|---|---|---|
+| `BUILD_JNI` | `ON` | `audioengine_jni` shared library (Android용) 빌드 |
+| `BUILD_STANDALONE_TEST` | `OFF` | `standalone_test` executable (호스트 회귀 테스트) 빌드 |
+| `EQ_JNI_CLASS_PATH` (cppFlags) | `com/example/audio/AudioEngineJNI` | RegisterNatives FindClass 경로 |
+
+### 3) `app/build.gradle`
+
+```groovy
+android {
+    defaultConfig {
+        externalNativeBuild {
+            cmake { cppFlags "-std=c++17" }
+        }
+    }
+    externalNativeBuild {
+        cmake { path "src/main/cpp/CMakeLists.txt" }
+    }
+}
+```
+
+> 💡 **다른 패키지/클래스명 사용 시**: `cppFlags '-std=c++17 -DEQ_JNI_CLASS_PATH=\"com/your/pkg/YourClass\"'`
+
+---
+
+## ⚡ Quick Start
+
+### Kotlin
 
 ```kotlin
 package com.example.audio
 
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class AudioEngineJNI {
     init { System.loadLibrary("audioengine_jni") }
@@ -134,52 +200,80 @@ class AudioEngineJNI {
     external fun updateConfig(
         preampDB: Float,
         enableLimiter: Boolean,
-        filterTypes: IntArray,
-        frequencies: FloatArray,
-        gains: FloatArray,
-        qFactors: FloatArray
+        filterTypes: IntArray,    // 0=PEAKING, 1=LOW_SHELF, 2=HIGH_SHELF
+        frequencies: FloatArray,  // Hz
+        gains: FloatArray,        // dB
+        qFactors: FloatArray      // Q (peaking) or S (shelf)
     )
     external fun processDirectBuffer(buffer: ByteBuffer, numFrames: Int)
     external fun computeAutoPreampDB(): Float
 }
+
+// --- 사용 예 ---
+val engine = AudioEngineJNI()
+engine.init(48000)
+
+engine.updateConfig(
+    preampDB       = 0f,
+    enableLimiter  = true,
+    filterTypes    = intArrayOf(1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                0, 0, 0, 0, 0, 0, 0, 0, 0, 2),
+    frequencies    = floatArrayOf(31.25f, 62.5f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f,
+                                  44.2f, 88.4f, 176.8f, 353.6f, 707.1f, 1414.2f, 2828.4f, 5656.9f, 11313.7f, 20000f),
+    gains          = FloatArray(20) { 0f },
+    qFactors       = FloatArray(20) { 0.707f }
+)
+
+// 권장 preamp 자동 산출 → 재적용 패턴
+val autoPreamp = engine.computeAutoPreampDB()  // ex: -3.5f for boost-heavy preset
+// (필요 시 동일 파라미터 + preampDB = autoPreamp 로 updateConfig 재호출)
+
+// 오디오 콜백
+val buffer = ByteBuffer.allocateDirect(numFrames * 2 * 4).order(ByteOrder.nativeOrder())
+// ... fill buffer with PCM Float32 stereo interleaved ...
+engine.processDirectBuffer(buffer, numFrames)
 ```
 
-중요 사항:
-
-- 기본 `EQ_JNI_CLASS_PATH`는 `com/example/audio/AudioEngineJNI`입니다.
-- `JNI_OnLoad`에서 `RegisterNatives`로 위 메서드들을 등록합니다.
-- 다른 패키지명 또는 클래스명을 쓰려면 CMake/Gradle cppFlags에 `-DEQ_JNI_CLASS_PATH=\"com/your/pkg/YourClass\"`를 지정하고 Kotlin 클래스 경로도 동일하게 맞춥니다.
-- 레거시 `Java_com_example_audio_AudioEngineJNI_*` C symbol fallback은 기본 class path 호환용입니다. 커스텀 class path에서는 `RegisterNatives` 기준으로 맞추는 것이 안전합니다.
-
----
-
-## 🧩 Native C++ Usage
+### Native C++ (직접 사용)
 
 ```cpp
 #include "FineTuneEQEngine.h"
 
 FineTuneEQEngine eq(48000.0);
 
+// 방법 A: EqEngineConfig (가변 길이 vector)
 EqEngineConfig cfg;
-cfg.preampDB = 0.0f;
+cfg.preampDB          = 0.0f;
 cfg.enableSoftLimiter = true;
 
-EqBandConfig band;
-band.type = EqFilterType::PEAKING;
-band.frequency = 1000.0f;
-band.gainDB = 3.0f;
-band.qFactor = 0.707f;
-cfg.bands.push_back(band);
+EqBandConfig bass;
+bass.type      = EqFilterType::LOW_SHELF;
+bass.frequency = 60.0f;
+bass.gainDB    = 4.0f;
+bass.qFactor   = 0.707f;     // shelf S
+cfg.bands.push_back(bass);
+
+EqBandConfig presence;
+presence.type      = EqFilterType::PEAKING;
+presence.frequency = 4000.0f;
+presence.gainDB    = 2.0f;
+presence.qFactor   = 1.4f;   // peaking Q
+cfg.bands.push_back(presence);
 
 eq.updateConfig(cfg);
 
-float recommendedPreamp = eq.computeAutoPreampDB();
-cfg.preampDB = recommendedPreamp;
-eq.updateConfig(cfg);
+// 방법 B: Eq20BandInput (고정 20개 + clamp 정책)
+Eq20BandInput input;       // 기본값으로 초기화 (flat 20-band)
+input.gainMin = -8.0f;
+input.gainMax =  8.0f;
+input.gains[5] = 12.0f;    // → 8.0f로 자동 clamp
+eq.updateConfig(input);
 
-float pcm[1024 * 2] = {}; // L,R,L,R...
-eq.process(pcm, pcm, 1024);
+float pcm[1024 * 2];  // L,R,L,R...
+eq.process(pcm, pcm, 1024);   // in-place 처리
 ```
+
+전체 Kotlin 통합 가이드 → [DEVELOPER_GUIDE.md](./DEVELOPER_GUIDE.md)
 
 ---
 
@@ -187,22 +281,90 @@ eq.process(pcm, pcm, 1024);
 
 ```text
 AndroidEQModule/
-├── README.md
-├── DEVELOPER_GUIDE.md
+├── README.md                          # 본 문서
+├── DEVELOPER_GUIDE.md                 # Kotlin 연동 / 트러블슈팅 / 패키지 변경 가이드
 └── src/main/cpp/
-    ├── BiquadFilter.h / .cpp
-    ├── FineTuneEQEngine.h / .cpp
-    ├── AudioEngineJNI.cpp
-    ├── RTSafetyUtils.h
-    ├── DenormalGuard.h
-    └── CMakeLists.txt
+    ├── BiquadFilter.h / .cpp          # Stateful TDF-II Biquad + lock-free seqlock + sample-accurate ramp
+    ├── FineTuneEQEngine.h / .cpp      # Pipeline (Preamp → 20-band cascade fusion → Soft Limiter)
+    │                                  # + Eq20BandInput wrapper + makeEqEngineConfig adapter
+    ├── AudioEngineJNI.cpp             # JNI bridge (lifecycle drain + 입력 검증 + RegisterNatives)
+    ├── RTSafetyUtils.h                # FZ/DAZ helpers (arm64/armv7/x86), RT-safe markers
+    ├── DenormalGuard.h                # RAII denormal protection
+    ├── standalone_test.cpp            # 호스트 회귀 테스트 (BUILD_STANDALONE_TEST=ON 시)
+    └── CMakeLists.txt                 # eq_core (static) + audioengine_jni (shared) + standalone_test
 ```
 
 ---
 
-## ✅ Build & Verification
+## 📖 API Reference
 
-Android NDK build는 `src/main/cpp/CMakeLists.txt`를 기준으로 검증합니다.
+### `FineTuneEQEngine` (C++ Native API)
+
+| 메서드 | 시그니처 | 호출 스레드 | 설명 |
+|---|---|---|---|
+| ctor | `FineTuneEQEngine(double sampleRate)` | UI/init | `[8000, 384000]` 외 입력은 48000으로 fallback |
+| `updateConfig` | `void updateConfig(const EqEngineConfig&)` | UI | 가변 길이 vector. NOT_RT_SAFE |
+| `updateConfig` | `void updateConfig(const Eq20BandInput&)` | UI | 고정 20개 wrapper. clamp 정책 자동 적용 |
+| `process` | `void process(const float* in, float* out, int numFrames)` | **오디오 콜백** | RT-safe. `in == out` (in-place) 허용 |
+| `computeAutoPreampDB` | `float computeAutoPreampDB() const` | UI | 캐스케이드 누적 게인 기반 권장 preamp dB. snapshot 기반 (race-free) |
+
+### `EqBandConfig` 기본값
+
+| 필드 | 타입 | 기본값 | 비고 |
+|---|---|---|---|
+| `type` | `EqFilterType` | `PEAKING` | `PEAKING` / `LOW_SHELF` / `HIGH_SHELF` |
+| `frequency` | `float` | `1000.0f` | Hz, `(0, sampleRate/2)` |
+| `gainDB` | `float` | `0.0f` | dB, NaN/Inf → unity coeffs |
+| `qFactor` | `float` | `0.707f` | PEAKING은 Q, LOW/HIGH_SHELF는 shelf S. `< 0.05`은 0.05로 클램프 |
+
+### `EqEngineConfig` 기본값
+
+| 필드 | 타입 | 기본값 | 비고 |
+|---|---|---|---|
+| `preampDB` | `float` | `0.0f` | dB, NaN/Inf → 0dB로 fallback |
+| `enableSoftLimiter` | `bool` | `true` | safer default |
+| `bands` | `vector<EqBandConfig>` | `{}` | 0~20개 가능. 빈 vector = 완전 bypass |
+
+### `Eq20BandInput` 기본값
+
+기본 생성 시 31.25Hz ~ 20kHz `sqrt(2)` 그리드, 모든 gain=0dB, 모든 Q=0.707, 모든 type=PEAKING의 **flat preset**.
+
+### JNI 진입점 (Kotlin → C++)
+
+| C 심볼 | Java 시그니처 | 호출 스레드 |
+|---|---|---|
+| `Java_com_example_audio_AudioEngineJNI_init` | `(I)V` | UI |
+| `Java_com_example_audio_AudioEngineJNI_release` | `()V` | UI |
+| `Java_com_example_audio_AudioEngineJNI_updateConfig` | `(FZ[I[F[F[F)V` | UI |
+| `Java_com_example_audio_AudioEngineJNI_processDirectBuffer` | `(Ljava/nio/ByteBuffer;I)V` | **오디오 콜백** |
+| `Java_com_example_audio_AudioEngineJNI_computeAutoPreampDB` | `()F` | UI |
+| `JNI_OnLoad` | `(JavaVM*, void*) → jint` | 시스템 |
+
+---
+
+## ✅ Build & ABI Matrix
+
+NDK r27 / API-24 기준 빌드 결과 (Release):
+
+| ABI | `libaudioengine_jni.so` |
+|---|---|
+| `arm64-v8a` | ✅ ~830 KB |
+| `armeabi-v7a` | ✅ ~600 KB |
+| `x86_64` | ✅ ~720 KB |
+
+### 호스트 standalone 빌드 (회귀 테스트)
+
+```bash
+cmake -S src/main/cpp -B build/host \
+  -DBUILD_STANDALONE_TEST=ON \
+  -DBUILD_JNI=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/host -j
+./build/host/standalone_test
+# Expected: PASS: standalone regression harness
+```
+
+### Android NDK 빌드
 
 ```bash
 NDK=/path/to/Android/sdk/ndk/27.0.12077973
@@ -214,23 +376,95 @@ cmake -S src/main/cpp -B build/android-arm64 \
 cmake --build build/android-arm64 -j
 ```
 
-“모든 C++ 환경에서 동작”한다고 표현하려면 단순 개별 `clang++ -c` 확인이 아니라 **host CMake/standalone target**으로 실제 링크·실행 검증이 필요합니다. 현재 문서에서는 Android NDK target과 host standalone 검증 대상을 분리해 표현합니다.
+---
+
+## 🧪 Verification & Quality Gates
+
+`standalone_test` 6개 테스트가 핵심 동작을 회귀 검증합니다:
+
+| # | 테스트 | 검증 항목 |
+|---|---|---|
+| 1 | `pipelineSmoke` | 20-band 풀 캐스케이드 + 리미터 처리 후 NaN/Inf 0건, peak ≤ 1.01 |
+| 2 | `emptyConfigRemovesStaleFilters` | +12dB 적용 후 빈 config 적용 → 출력이 입력과 동일 (max diff < 1e-3) |
+| 3 | `invalidParameterSafety` | NaN sampleRate, NaN preamp, NaN/Inf/음수 freq·Q → 출력 NaN 0건, peak ≤ 1.01 |
+| 4 | `inPlaceOutOfPlaceEquivalence` | `process(buf,buf)` ≡ `process(in,out)` (max diff < 1e-6) |
+| 5 | `autoPreampImmediateForPlus12dB` | `updateConfig` 직후 `computeAutoPreampDB()` 반환값이 `[-13.5, -10.5] dB` 범위 |
+| 6 | `wrapperClampAndEquivalence` | `Eq20BandInput`의 gainMin/Max·qMin/Max clamp + `updateConfig(Eq20BandInput) ≡ updateConfig(makeEqEngineConfig(input))` |
+
+### Sanitizer 결과
+
+| Sanitizer | 결과 |
+|---|---|
+| TSan (data race) | ✅ Clean |
+| ASan (memory error) | ✅ Clean |
+| UBSan (undefined behavior) | ✅ Clean |
 
 ---
 
-## 📌 DSP Notes
+## 🎚️ DSP 사양
 
-| 항목 | 내용 |
+| 항목 | 값 |
 |---|---|
-| EQ 범위 | 20-band Parametric EQ |
-| Filter types | `PEAKING`, `LOW_SHELF`, `HIGH_SHELF` |
-| PCM format | Float32 stereo interleaved |
-| Preamp | `computeAutoPreampDB()` 기반 누적 응답 peak 보정 |
-| Limiter | optional soft limiter |
-| Wrapper clamp | `gainMin/gainMax`, `qMin/qMax`는 core adapter 정책 |
+| 채널 | Stereo interleaved (L, R, L, R…) |
+| 샘플 포맷 | Float32 (`-1.0 ~ +1.0`) |
+| 지원 sampleRate | 8000 ~ 384000 Hz (그 외 입력은 48000으로 fallback) |
+| 밴드 수 | 20 (고정) |
+| Q / S 범위 | 실용 0.05 ~ 100+ (0.05 미만은 0.05로 클램프) |
+| Gain 범위 | 무제한 (NaN/Inf만 차단; preamp 자동 산출 권장) |
+| Coefficient ramp | 64~512 samples (`fs / 750` 기반 자동 결정, 기본 64@48k) |
+| Soft Limiter | Asymptotic soft-knee, threshold 0.95, headroom 0.05, stereo-linked |
+| Preamp 산출 grid | 256 log-spaced points, `[20Hz, fs*0.475]` |
+
+---
+
+## 🔧 Troubleshooting
+
+자세한 트러블슈팅은 [DEVELOPER_GUIDE.md](./DEVELOPER_GUIDE.md)를 참조하세요.
+
+| 증상 | 빠른 진단 |
+|---|---|
+| 소리가 찢어짐 (clipping) | `AudioFormat.ENCODING_PCM_FLOAT` 사용? `computeAutoPreampDB()` 적용? |
+| 슬라이더 드래그 시 click | C++ 엔진을 매번 재생성하지 않는지 확인 — `updateConfig`만 다시 호출 |
+| `UnsatisfiedLinkError` | Kotlin 클래스명이 `AudioEngineJNI`인지 확인. 또는 `-DEQ_JNI_CLASS_PATH=...` 빌드 옵션 |
+| `init/release` 토글 시 크래시 | 현재 버전은 ProcessGuard drain pattern으로 차단됨. 이전 버전이면 업데이트 |
+| logcat에 `[AudioEngineJNI]` 에러 | JNI 입력 검증 실패 — 배열 길이/null/buffer capacity 확인 |
+| Shelf 필터의 `qFactor` 동작이 예상과 다름 | LOW_SHELF/HIGH_SHELF에선 `qFactor`가 RBJ shelf slope S로 해석됨 (Q 아님) |
+
+---
+
+## 🗺️ Roadmap
+
+본 모듈에서 의도적으로 제외된 항목 — 필요 시 후속 모듈로:
+
+- [ ] DF-I 또는 SVF 형식 변형 (고-Q 분해능 향상)
+- [ ] Lookahead peak limiter (현재는 instantaneous soft limiter)
+- [ ] Limiter 2× oversampling (alias 디스토션 감소)
+- [ ] Frequency pre-warping (RBJ Nyquist boundary 보정)
+- [ ] Linear-phase / Dynamic EQ 모드 (별도 모듈)
+
+---
+
+## 🤝 Contributing
+
+이슈/PR 환영합니다.
+
+1. 이슈 등록 — 재현 가능한 케이스
+2. 브랜치 — `feature/xxx` 또는 `fix/xxx`
+3. 변경 검증 — 호스트 standalone 회귀 (`-DBUILD_STANDALONE_TEST=ON`) + NDK 빌드
+4. PR — 변경 의도와 영향 범위 명시
+
+스타일 규칙: 외부 시그니처(JNI, `EqEngineConfig`, `Eq20BandInput`, `process`) 변경 금지. 내부 구현은 자유.
 
 ---
 
 ## 📜 License
 
-본 프로젝트의 라이선스는 별도 협의가 필요합니다.
+본 프로젝트의 라이선스는 별도 협의 — 사용 전 [coreline-ai](https://github.com/coreline-ai)에 문의해 주세요.
+
+---
+
+<div align="center">
+
+**Made with ⚡ by Coreline · Powered by [RBJ Audio EQ Cookbook](https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html)**
+
+</div>

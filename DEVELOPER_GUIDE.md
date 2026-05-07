@@ -55,7 +55,7 @@ class AudioEngineJNI {
         filterTypes: IntArray,    // 0=PEAKING, 1=LOW_SHELF, 2=HIGH_SHELF
         frequencies: FloatArray,  // Hz
         gains: FloatArray,        // dB
-        qFactors: FloatArray      // Q
+        qFactors: FloatArray      // PEAKING=Q, LOW/HIGH_SHELF=RBJ shelf slope S
     )
 
     external fun processDirectBuffer(buffer: ByteBuffer, numFrames: Int)
@@ -69,6 +69,7 @@ class AudioEngineJNI {
 - 배열 길이는 최대 20개로 취급합니다.
 - 20개보다 적은 입력은 나머지 band를 flat/bypass로 다루는 방향이어야 합니다.
 - `filterTypes` 값은 `0=PEAKING`, `1=LOW_SHELF`, `2=HIGH_SHELF` Parametric EQ 범위 안에서만 사용합니다.
+- `qFactors`의 의미는 filter type에 따라 다릅니다. `PEAKING`은 Q factor이고, `LOW_SHELF`/`HIGH_SHELF`는 RBJ Cookbook의 shelf slope `S`로 해석합니다.
 
 ---
 
@@ -175,6 +176,17 @@ Host C++ 검증은 “모든 C++ 환경”이라는 표현을 쓰기 전에 별�
 - 단순 `clang++ -c`는 컴파일 단위 검증일 뿐입니다.
 - host CMake/standalone executable 또는 test target을 구성해 link와 runtime smoke test까지 확인해야 합니다.
 - JNI/Android 의존 파일은 host target에서 제외하거나 stub 처리해야 합니다.
+
+Host standalone 검증 예시:
+
+```bash
+cmake -S src/main/cpp -B build/host \
+  -DBUILD_STANDALONE_TEST=ON \
+  -DBUILD_JNI=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/host -j
+./build/host/standalone_test
+```
 
 ---
 

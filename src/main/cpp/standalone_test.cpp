@@ -209,6 +209,60 @@ bool autoPreampImmediateForPlus12dB(TestFailure& failure) {
     return true;
 }
 
+bool wrapperClampAndEquivalence(TestFailure& failure) {
+    Eq20BandInput input;
+    input.gainMin = -5.0f;
+    input.gainMax = 5.0f;
+    input.qMin = 0.3f;
+    input.qMax = 5.0f;
+
+    for (int i = 0; i < Eq20BandInput::NUM_BANDS; ++i) {
+        input.filterTypes[i] = EqFilterType::PEAKING;
+        input.frequencies[i] = 100.0f * static_cast<float>(i + 1);
+        input.gains[i] = 10.0f;      // must clamp to +5 dB
+        input.qFactors[i] = 0.01f;   // must clamp to 0.3
+    }
+
+    const EqEngineConfig converted = makeEqEngineConfig(input);
+    if (converted.bands.size() != Eq20BandInput::NUM_BANDS) {
+        failure = {"wrapper clamp/equivalence", "converted band count is not 20"};
+        return false;
+    }
+    for (const auto& band : converted.bands) {
+        if (std::fabs(band.gainDB - 5.0f) > 1.0e-6f) {
+            failure = {"wrapper clamp/equivalence", "gain was not clamped to gainMax"};
+            return false;
+        }
+        if (std::fabs(band.qFactor - 0.3f) > 1.0e-6f) {
+            failure = {"wrapper clamp/equivalence", "Q was not clamped to qMin"};
+            return false;
+        }
+    }
+
+    FineTuneEQEngine wrapperEngine(kSampleRate);
+    FineTuneEQEngine configEngine(kSampleRate);
+    wrapperEngine.updateConfig(input);
+    configEngine.updateConfig(converted);
+
+    const int frames = 2048;
+    const auto source = makeStereoSine(frames, 1000.0f, 0.2f);
+    auto wrapperOut = source;
+    std::vector<float> configOut(source.size(), 0.0f);
+    wrapperEngine.process(wrapperOut.data(), wrapperOut.data(), frames);
+    configEngine.process(source.data(), configOut.data(), frames);
+
+    float maxDiff = 0.0f;
+    for (size_t i = 0; i < source.size(); ++i) {
+        maxDiff = std::max(maxDiff, std::fabs(wrapperOut[i] - configOut[i]));
+    }
+    if (maxDiff > 1.0e-6f) {
+        failure = {"wrapper clamp/equivalence", "wrapper/config output mismatch; max diff=" +
+                                                  std::to_string(maxDiff)};
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -218,6 +272,7 @@ int main() {
         invalidParameterSafety,
         inPlaceOutOfPlaceEquivalence,
         autoPreampImmediateForPlus12dB,
+        wrapperClampAndEquivalence,
     };
 
     for (auto test : tests) {
