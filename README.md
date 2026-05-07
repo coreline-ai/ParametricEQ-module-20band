@@ -11,13 +11,14 @@
 [![DSP](https://img.shields.io/badge/DSP-RBJ%20Cookbook-orange)](https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html)
 [![Real-Time Safe](https://img.shields.io/badge/Real--Time-Lock--Free-green)](#%EF%B8%8F-real-time-safety-guarantees)
 [![Sanitizers](https://img.shields.io/badge/TSan%20%2F%20ASan%20%2F%20UBSan-Clean-brightgreen)](#-verification--quality-gates)
+[![Production Ready](https://img.shields.io/badge/Production-Ready-success)](#-production-readiness)
 [![License](https://img.shields.io/badge/License-Proprietary-lightgrey)](#-license)
 
-**Android 환경의 lock-free, real-time safe 20-band Parametric EQ — 독립형 C++ DSP 코어**
+**Android 환경의 lock-free, real-time safe 20-band Parametric EQ — 프로덕션급 독립형 C++ DSP 코어**
 
 RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct ByteBuffer · Oboe/AAudio/AudioTrack 어떤 I/O와도 결합 가능
 
-[Overview](#-overview) · [Scope](#-scope) · [EQ Comparison](#-eq-type-comparison) · [Quick Start](#-quick-start) · [API](#-api-reference) · [Build](#-build--abi-matrix) · [Verification](#-verification--quality-gates) · [Developer Guide](./DEVELOPER_GUIDE.md)
+[Overview](#-overview) · [Scope](#-scope) · [EQ Comparison](#-eq-type-comparison) · [Quick Start](#-quick-start) · [API](#-api-reference) · [Build](#-build--abi-matrix) · [Verification](#-verification--quality-gates) · [Production](#-production-readiness) · [Developer Guide](./DEVELOPER_GUIDE.md)
 
 </div>
 
@@ -26,6 +27,8 @@ RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct 
 ## 🎯 Overview
 
 이 모듈은 안드로이드(또는 일반 C++) 환경에서 오디오 스트림에 **20-band Parametric EQ**를 적용하는 독립형 C++ DSP 코어입니다. 오디오 I/O 계층(Oboe/AAudio/AudioTrack)과 DSP 연산을 완전히 분리한 블랙박스로 설계되어, 어떤 출력 파이프라인에 끼워 넣어도 동일하게 동작합니다.
+
+**프로덕션 환경 가정** — 음악 플레이어, 헤드폰 보정, 톤 조절 같이 사용자가 EQ 슬라이더를 실시간 드래그하고 화면 전환·앱 백그라운드 토글이 빈번한 모바일 환경에서, 클릭 노이즈 / UAF 크래시 / data race 없이 동작하도록 설계되었습니다.
 
 ### 신호 흐름
 
@@ -95,6 +98,8 @@ RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct 
 > ⚠️ **중요**: `EqBandConfig::qFactor` 필드는 PEAKING에선 Q (bandwidth)이고, LOW_SHELF/HIGH_SHELF에선 RBJ shelf slope S (transition steepness)로 해석됩니다. 동일 필드명이지만 type에 따라 의미가 다릅니다. 수식은 [RBJ Audio EQ Cookbook](https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html)을 100% 따릅니다.
 
 ### 🛡️ Real-Time Safety Guarantees
+
+프로덕션 모바일 오디오 콜백(10~20ms 데드라인)을 가정하고 설계한 안전 계약입니다.
 
 | 보장 | 메커니즘 |
 |---|---|
@@ -408,6 +413,39 @@ cmake --build build/android-arm64 -j
 | TSan (data race) | ✅ Clean |
 | ASan (memory error) | ✅ Clean |
 | UBSan (undefined behavior) | ✅ Clean |
+
+---
+
+## 🚦 Production Readiness
+
+이 모듈은 다음 프로덕션 시나리오에서 발생하는 실제 폭발 케이스를 통과한 상태입니다.
+
+| 프로덕션 시나리오 | 차단 메커니즘 |
+|---|---|
+| 재생 중 EQ 슬라이더 빠른 드래그 | Lock-free seqlock + 64~512 sample ramp |
+| 화면 종료 직전 `release()` 호출 | ProcessGuard drain pattern (in-flight counter) |
+| 백그라운드 ↔ 포그라운드 빠른 토글 | `init/release` 사이의 swap & drain |
+| 자동 preamp UI 갱신과 슬라이더 변경 동시 발생 | Snapshot mutex (audio thread 활성 상태와 분리) |
+| 프리셋 초기화 (`bands` 비우기 / 부분 적용) | NUM_BANDS 전체 루프 + flat fallback |
+| 사용자 입력 부주의 (NaN/Inf gain·Q, 0 Q, 음수 freq) | sanitizeBandInputs → flat coeff fallback |
+| 잘못된 sampleRate 전달 | 8000~384000 외 → 48000 fallback |
+| Kotlin 측 잘못된 배열 길이 / null / 작은 ByteBuffer | JNI 입력 검증 + early return + audit log |
+| 패키지명 변경 | `EQ_JNI_CLASS_PATH` 매크로 (소스 수정 불필요) |
+
+### 프로덕션 출고 전 체크리스트
+
+- [x] DSP 수식 정확성 (RBJ Cookbook 100% 일치)
+- [x] Real-Time 안전 계약 (lock-free, allocation-free, blocking-free 오디오 콜백)
+- [x] Lifecycle UAF 차단 (init/release/updateConfig/processDirectBuffer/computeAutoPreampDB 5개 진입점)
+- [x] Data race 부재 (TSan clean)
+- [x] Memory safety (ASan clean)
+- [x] Undefined behavior 부재 (UBSan clean)
+- [x] 입력 sanitization (NaN/Inf/범위 외 모두 안전한 fallback)
+- [x] Click/zipper 방지 (sample-accurate coefficient ramp)
+- [x] Denormal CPU 폭주 방지 (FZ/DAZ RAII guard)
+- [x] Stereo image 보존 (linked limiter)
+- [x] NDK 멀티 ABI 빌드 (arm64-v8a / armeabi-v7a / x86_64 × Release / Debug)
+- [x] 호스트 standalone 회귀 (6 케이스, sanitizer 동시 통과)
 
 ---
 
