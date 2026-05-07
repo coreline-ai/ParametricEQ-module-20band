@@ -18,7 +18,7 @@
 
 RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct ByteBuffer · Oboe/AAudio/AudioTrack 어떤 I/O와도 결합 가능
 
-[Overview](#-overview) · [Scope](#-scope) · [EQ Comparison](#-eq-type-comparison) · [Quick Start](#-quick-start) · [API](#-api-reference) · [Build](#-build--abi-matrix) · [Verification](#-verification--quality-gates) · [Production](#-production-readiness) · [Developer Guide](./DEVELOPER_GUIDE.md)
+[Overview](#-overview) · [Scope](#-scope) · [EQ Comparison](#-eq-type-comparison) · [IIR / Biquad](#-what-is-iir--biquad) · [Quick Start](#-quick-start) · [API](#-api-reference) · [Build](#-build--abi-matrix) · [Verification](#-verification--quality-gates) · [Production](#-production-readiness) · [Developer Guide](./DEVELOPER_GUIDE.md)
 
 </div>
 
@@ -82,6 +82,119 @@ RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct 
 | **본 프로젝트 포함** | ✅ **포함** | ❌ 제외 | ❌ 제외 |
 
 > 📌 **선택 근거**: Android 실시간 콜백 (10~20ms 버퍼) + 모바일 SoC CPU 예산 + 음악 앱/헤드폰 보정 용도에선 Parametric EQ가 latency·CPU·결정성 모두 가장 적합. Linear-phase / Dynamic EQ가 필요해지면 별도 모듈로 추가하되 본 모듈 시그니처는 변경하지 않는 방향이 안전.
+
+---
+
+## 🧮 What is IIR / Biquad?
+
+본 프로젝트의 핵심 DSP는 **20개의 biquad IIR 필터를 직렬(cascade)로 연결**한 구조입니다. 이 절에서는 IIR과 biquad 개념을 정확하게 정의하고, 본 코드에서 어떻게 구현되었는지 매핑합니다.
+
+### IIR (Infinite Impulse Response)
+
+> 임펄스(1샘플 짧은 펄스)를 입력했을 때, 출력이 **이론상 영원히** 사라지지 않는 필터.
+>
+> 영원한 이유는 **과거 출력값을 자기 자신에 피드백**하기 때문입니다.
+
+일반 IIR의 차분 방정식:
+
+```text
+y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] + ...
+              − a1·y[n-1] − a2·y[n-2] − ...
+       ┕━ feedforward (입력의 가중합)        ┕━ feedback (출력을 자기에 다시 곱함)
+```
+
+- `x[n]`: 현재 입력 샘플
+- `y[n]`: 현재 출력 샘플
+- `bᵢ`: feedforward 계수 (입력 측)
+- `aⱼ`: **feedback 계수** ← 이게 "I"(Infinite)의 핵심
+
+### Biquad (Bi-Quadratic)
+
+본 프로젝트는 IIR 중에서도 **2차(2nd-order) IIR = biquad** 를 씁니다. "Bi-Quadratic"은 분자·분모가 모두 2차 다항식인 유리 transfer function을 뜻합니다.
+
+z-domain transfer function:
+
+```text
+        b0 + b1·z⁻¹ + b2·z⁻²
+H(z) = ──────────────────────
+        1 + a1·z⁻¹ + a2·z⁻²
+```
+
+차분 방정식:
+
+```text
+y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] − a1·y[n-1] − a2·y[n-2]
+```
+
+이 5개의 계수 `(b0, b1, b2, a1, a2)`가 한 EQ 밴드의 모든 동작(주파수, 게인, Q/S, 필터 타입)을 결정합니다.
+
+### 본 코드에서의 매핑 — `processSampleL`
+
+[BiquadFilter.h:56-61](src/main/cpp/BiquadFilter.h#L56)의 hot-path를 그대로 인용:
+
+```cpp
+RT_SAFE inline float processSampleL(float in) {
+    const float out = in * activeB0_ + z1_L_;          // y[n] 산출
+    z1_L_ = in * activeB1_ - out * activeA1_ + z2_L_;  // delay state 1 갱신 (feedback 포함)
+    z2_L_ = in * activeB2_ - out * activeA2_;          // delay state 2 갱신 (feedback 포함)
+    return out;
+}
+```
+
+| 변수 | 의미 |
+|---|---|
+| `in` | 현재 입력 `x[n]` |
+| `out` | 현재 출력 `y[n]` |
+| `z1_L_, z2_L_` | **delay line / state** — 과거 입출력을 인코딩한 메모리 |
+| `activeB0~B2` | feedforward 계수 |
+| `activeA1, A2` | **feedback 계수** ← `out`을 다시 state에 반영하는 부분 |
+
+`out` 값을 산출한 뒤 `out * activeA1`로 다시 state에 곱해 들어가는 게 "출력이 자기 자신으로 메아리치는" 구조입니다. 이 형식은 **Transposed Direct Form II (TDF-II)** 로, 부동소수점 안정성이 가장 좋은 biquad 구현 형식 중 하나입니다.
+
+### IIR vs FIR (Linear-phase EQ가 사용)
+
+| 항목 | IIR (본 프로젝트) | FIR (Linear-phase EQ) |
+|---|---|---|
+| **약자** | Infinite Impulse Response | Finite Impulse Response |
+| **수식** | `y[n] = Σbᵢx[n-i] − Σaⱼy[n-j]` (feedback 있음) | `y[n] = Σbᵢx[n-i]` (feedforward만) |
+| **메모리** | 과거 출력 재사용 (state z1, z2…) | 과거 입력만 사용 |
+| **계수 수** | 적음 (biquad = 5개) | 많음 (수백~수천 tap) |
+| **CPU 비용** | 매우 낮음 | 높음 (FFT/convolution) |
+| **Latency** | 매우 낮음 (수 sample) | 높음 (FIR 길이 / 2) |
+| **위상 응답** | 비선형 (frequency마다 phase 다름) | 선형 (모든 frequency 동일 phase) |
+| **Pre-ringing** | 없음 | 있음 (transient에서 가청) |
+| **안정성** | 계수가 잘못되면 발진 가능 | 항상 안정 |
+| **NaN 전파** | 있음 (state로 영원히 오염될 수 있음) | 없음 (state 없음) |
+| **모바일 실시간 적합성** | 🟢 매우 적합 | 🔴 부담 |
+
+### IIR의 단점 ↔ 본 프로젝트의 대처 매핑
+
+IIR이 모바일에 유리한 만큼 부작용도 있는데, 각각을 어떻게 닫았는지 정리합니다.
+
+| IIR 단점 | 본 프로젝트 대처 | 코드 위치 |
+|---|---|---|
+| 위상 비선형 | 음악 앱·헤드폰 보정 용도엔 마스터링급 phase coherence 불필요 — 수용 | (정책) |
+| 계수 변경 시 click (state ↔ 새 transfer function mismatch) | **64~512 sample 선형 ramp + 종점 snap** | [BiquadFilter.cpp:88-105](src/main/cpp/BiquadFilter.cpp#L88) |
+| Denormal로 인한 CPU 폭주 (state가 1e-38 이하로 수렴) | **`DenormalGuard` RAII**로 process 진입 시 FZ/DAZ 활성 | [DenormalGuard.h](src/main/cpp/DenormalGuard.h) |
+| NaN/Inf 영구 전파 (한 번 state 오염 시 영원) | **PCM finite guard**: 입력 mute + cascade 출력 non-finite 감지 시 state reset | [FineTuneEQEngine.cpp `process()`](src/main/cpp/FineTuneEQEngine.cpp) |
+| 고-Q에서 부동소수점 분해능 저하 (TDF-II 한계) | 현재 수용 (후속: DF-I 또는 SVF 변형) | (Roadmap) |
+| 잘못된 계수에서 발진 가능 | RBJ Cookbook이 안정성 보장 + sanity guard로 NaN/Q≤0/≥Nyquist 차단 | [`sanitizeBandInputs`](src/main/cpp/FineTuneEQEngine.cpp) |
+
+### Biquad가 EQ에서 하는 역할
+
+본 프로젝트의 RBJ Cookbook 변환은 **사용자가 입력한 `(frequency, gain, Q 또는 S, 필터타입)`을 위 5개 biquad 계수로 변환**합니다. 변환 코드:
+
+| 필터 타입 | RBJ 변환 함수 | 핵심 파라미터 |
+|---|---|---|
+| `PEAKING` | `calculatePeakingCoeffs` | freq, gain, **Q** |
+| `LOW_SHELF` | `calculateLowShelfCoeffs` | freq, gain, **S (shelf slope)** |
+| `HIGH_SHELF` | `calculateHighShelfCoeffs` | freq, gain, **S (shelf slope)** |
+
+→ [FineTuneEQEngine.cpp:77-156](src/main/cpp/FineTuneEQEngine.cpp#L77)
+
+### 한 줄 정리
+
+> 본 프로젝트는 **20개의 RBJ biquad IIR 필터를 직렬로 연결**한 cascade입니다. IIR을 쓴 이유는 모바일 실시간 오디오에서 **latency·CPU·결정성** 모두 가장 유리하기 때문이고, IIR의 부작용(click·denormal·NaN 전파)은 ramp / DenormalGuard / 입력+state finite guard로 대처합니다.
 
 ---
 
