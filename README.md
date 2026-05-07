@@ -111,6 +111,7 @@ RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct 
 | **Data race 부재** | `computeAutoPreampDB`가 audio thread 활성 상태 대신 config-side snapshot을 mutex로 보호 |
 | **부분 config = 진짜 bypass** | `bands.size() < 20`이면 나머지 필터는 자동으로 unity 계수 (stale 계수 잔존 0) |
 | **입력 sanitization** | NaN/Inf/Q≤0/지원 범위 밖 sampleRate 모두 안전한 fallback (flat coeff 또는 48kHz 기본값) |
+| **PCM finite guard** | 입력 PCM NaN/Inf는 cascade 진입 전 0으로 mute. cascade 출력이 non-finite면 20개 biquad delay state를 reset해 IIR 영구 오염 방지 |
 
 ### 🔌 JNI Hardening
 
@@ -391,20 +392,22 @@ cmake --build build/android-arm64 -j
 
 ## 🧪 Verification & Quality Gates
 
-`standalone_test` 10개 테스트가 핵심 동작을 회귀 검증합니다:
+`standalone_test` 12개 테스트가 핵심 동작을 회귀 검증합니다:
 
 | # | 테스트 | 검증 항목 |
 |---|---|---|
 | 1 | `pipelineSmoke` | 20-band 풀 캐스케이드 + 리미터 처리 후 NaN/Inf 0건, peak ≤ 1.01 |
 | 2 | `emptyConfigRemovesStaleFilters` | +12dB 적용 후 빈 config 적용 → 출력이 입력과 동일 (max diff < 1e-3) |
 | 3 | `invalidParameterSafety` | NaN sampleRate, NaN preamp, NaN/Inf/음수 freq·Q → 출력 NaN 0건, peak ≤ 1.01 |
-| 4 | `inPlaceOutOfPlaceEquivalence` | `process(buf,buf)` ≡ `process(in,out)` (max diff < 1e-6) |
-| 5 | `autoPreampImmediateForPlus12dB` | `updateConfig` 직후 `computeAutoPreampDB()` 반환값이 `[-13.5, -10.5] dB` 범위 |
-| 6 | `wrapperClampAndEquivalence` | `Eq20BandInput`의 gainMin/Max·qMin/Max clamp + `updateConfig(Eq20BandInput) ≡ updateConfig(makeEqEngineConfig(input))` |
-| 7 | `sampleRateSupportMatrix` | 44.1k/48k/88.2k/96k/176.4k/192k/352.8k/384kHz에서 finite output + finite auto preamp |
-| 8 | `unsupportedSampleRateFallsBackTo48000` | 44099/384001/NaN/Inf/0/-1Hz 입력이 48kHz fallback 출력과 동일 |
-| 9 | `sameRateNoResamplingFrameInvariant` | 44100/48000/384000Hz에서 `numFrames`로 지정한 stereo sample 영역만 기록 |
-| 10 | `nyquistFrequencyPolicy` | 44.1kHz에서 20kHz band 유효, 23kHz band flat 처리, 384kHz에서 100kHz band finite |
+| 4 | `nonFinitePcmInputDoesNotPoisonState` | PCM NaN/Inf 1샘플 입력 → 출력 finite 유지, 다음 정상 PCM block도 finite |
+| 5 | `nonFiniteCascadeOutputResetsState` | 극단적 finite PCM으로 내부 overflow 발생 가능 시 출력 mute + biquad state reset 후 정상 block 복구 |
+| 6 | `inPlaceOutOfPlaceEquivalence` | `process(buf,buf)` ≡ `process(in,out)` (max diff < 1e-6) |
+| 7 | `autoPreampImmediateForPlus12dB` | `updateConfig` 직후 `computeAutoPreampDB()` 반환값이 `[-13.5, -10.5] dB` 범위 |
+| 8 | `wrapperClampAndEquivalence` | `Eq20BandInput`의 gainMin/Max·qMin/Max clamp + `updateConfig(Eq20BandInput) ≡ updateConfig(makeEqEngineConfig(input))` |
+| 9 | `sampleRateSupportMatrix` | 44.1k/48k/88.2k/96k/176.4k/192k/352.8k/384kHz에서 finite output + finite auto preamp |
+| 10 | `unsupportedSampleRateFallsBackTo48000` | 44099/384001/NaN/Inf/0/-1Hz 입력이 48kHz fallback 출력과 동일 |
+| 11 | `sameRateNoResamplingFrameInvariant` | 44100/48000/384000Hz에서 `numFrames`로 지정한 stereo sample 영역만 기록 |
+| 12 | `nyquistFrequencyPolicy` | 44.1kHz에서 20kHz band 유효, 23kHz band flat 처리, 384kHz에서 100kHz band finite |
 
 ### Sanitizer 결과
 
@@ -428,7 +431,8 @@ cmake --build build/android-arm64 -j
 | 자동 preamp UI 갱신과 슬라이더 변경 동시 발생 | Snapshot mutex (audio thread 활성 상태와 분리) |
 | 프리셋 초기화 (`bands` 비우기 / 부분 적용) | NUM_BANDS 전체 루프 + flat fallback |
 | 사용자 입력 부주의 (NaN/Inf gain·Q, 0 Q, 음수 freq) | sanitizeBandInputs → flat coeff fallback |
-| 잘못된 sampleRate 전달 | 8000~384000 외 → 48000 fallback |
+| 잘못된 sampleRate 전달 | 44100~384000 외 → 48000 fallback |
+| 업스트림 PCM NaN/Inf 유입 | sample-level finite guard → 해당 sample mute + 필요 시 biquad delay state reset |
 | Kotlin 측 잘못된 배열 길이 / null / 작은 ByteBuffer | JNI 입력 검증 + early return + audit log |
 | 패키지명 변경 | `EQ_JNI_CLASS_PATH` 매크로 (소스 수정 불필요) |
 
@@ -441,11 +445,12 @@ cmake --build build/android-arm64 -j
 - [x] Memory safety (ASan clean)
 - [x] Undefined behavior 부재 (UBSan clean)
 - [x] 입력 sanitization (NaN/Inf/범위 외 모두 안전한 fallback)
+- [x] PCM finite guard (NaN/Inf sample mute + IIR state recovery)
 - [x] Click/zipper 방지 (sample-accurate coefficient ramp)
 - [x] Denormal CPU 폭주 방지 (FZ/DAZ RAII guard)
 - [x] Stereo image 보존 (linked limiter)
 - [x] NDK 멀티 ABI 빌드 (arm64-v8a / armeabi-v7a / x86_64 × Release / Debug)
-- [x] 호스트 standalone 회귀 (6 케이스, sanitizer 동시 통과)
+- [x] 호스트 standalone 회귀 (12 케이스, sanitizer 동시 통과)
 
 ---
 
@@ -460,6 +465,7 @@ cmake --build build/android-arm64 -j
 | 밴드 수 | 20 (고정) |
 | Q / S 범위 | 실용 0.05 ~ 100+ (0.05 미만은 0.05로 클램프) |
 | Gain 범위 | 무제한 (NaN/Inf만 차단; preamp 자동 산출 권장) |
+| PCM finite guard | 입력 PCM NaN/Inf는 0으로 mute. cascade 출력 non-finite 감지 시 20-band biquad delay state reset |
 | Coefficient ramp | 64~512 samples (`fs / 750` 기반 자동 결정, 기본 64@48k) |
 | Soft Limiter | Asymptotic soft-knee, threshold 0.95, headroom 0.05, stereo-linked |
 | Preamp 산출 grid | 256 log-spaced points, `[20Hz, fs*0.475]` |

@@ -71,6 +71,10 @@ public:
 
     // Core DSP processing for interleaved stereo Float32 buffers.
     // Handles Preamp -> 20-Band Biquad Cascade -> Soft Limiter.
+    // Processes exactly numFrames stereo frames; no resampling or frame-count change.
+    // Non-finite PCM samples are muted before the cascade, and any detected
+    // non-finite cascade output resets filter delay state to prevent persistent
+    // IIR NaN/Inf contamination.
     // inputPCM and outputPCM can point to the same memory for in-place processing.
     // RT_SAFE — must not allocate, lock, or block.
     void process(const float* inputPCM, float* outputPCM, int numFrames);

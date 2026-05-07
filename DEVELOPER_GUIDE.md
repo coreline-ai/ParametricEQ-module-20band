@@ -92,6 +92,7 @@ decoder/output PCM sampleRate
 - 지원 범위는 `44100Hz <= sampleRate <= 384000Hz`입니다.
 - `NaN`, `Inf`, `0`, 음수, `44100Hz` 미만, `384000Hz` 초과 입력은 core에서 `48000Hz`로 fallback합니다.
 - EQ는 입력 frame 수와 동일한 frame 수만 처리합니다. resampling/upsampling/downsampling은 하지 않습니다.
+- 입력 PCM sample 자체가 `NaN`/`Inf`인 경우 core는 해당 sample을 0으로 mute하고, cascade 출력이 non-finite로 감지되면 biquad delay state를 reset해 이후 정상 PCM block으로 복구합니다.
 - RBJ coefficient는 `w0 = 2πf / sampleRate`로 계산되므로, 실제 PCM sampleRate와 engine sampleRate가 다르면 EQ 중심 주파수가 틀어집니다.
 - `frequency >= sampleRate / 2`인 band는 안전하게 flat coefficient로 처리됩니다.
 
@@ -251,6 +252,7 @@ cmake --build build/host -j
 | `UnsatisfiedLinkError` | Kotlin class path와 `EQ_JNI_CLASS_PATH` 일치 여부, `System.loadLibrary("audioengine_jni")` 호출 여부 |
 | EQ 적용 후 clipping | `computeAutoPreampDB()` 기반 preamp를 적용했는지 확인 |
 | EQ 중심 주파수가 예상과 다름 | decoder/output PCM sampleRate와 `init(sampleRate)` 값이 같은지 확인 |
+| 갑자기 NaN/무음이 지속됨 | 현재 core는 PCM NaN/Inf guard와 state recovery를 수행합니다. 이전 버전이면 `release()`→`init()`으로 state를 초기화 |
 | 설정 변경 시 click/pop | 엔진 재생성 대신 기존 instance에 `updateConfig(...)`만 호출하는지 확인 |
 | 배열 입력 오류 | 4개 배열이 모두 준비되었는지, 20-band cap 정책과 null/길이 검증을 통과하는지 확인 |
 | PCM 처리 실패 | `ByteBuffer.allocateDirect(...)`, native byte order, `numFrames * 2 * sizeof(float)` capacity 확인 |

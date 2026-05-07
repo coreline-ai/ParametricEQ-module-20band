@@ -355,10 +355,26 @@ void FineTuneEQEngine::process(const float* inputPCM, float* outputPCM, int numF
         float l = inputPCM[2 * i]     * preamp;
         float r = inputPCM[2 * i + 1] * preamp;
 
+        // A single NaN/Inf sample can permanently poison IIR delay state.
+        // Clamp non-finite input after preamp, before it enters the cascade.
+        if (!std::isfinite(l)) l = 0.0f;
+        if (!std::isfinite(r)) r = 0.0f;
+
         for (int b = 0; b < Impl::NUM_BANDS; ++b) {
             l = filters[b].processSampleL(l);
             r = filters[b].processSampleR(r);
             filters[b].tickRamp();
+        }
+
+        // If state was already contaminated (or an extreme finite value
+        // overflowed internally), mute this frame and clear all biquad delay
+        // lines so the next finite input block can recover without re-init.
+        if (!std::isfinite(l) || !std::isfinite(r)) {
+            l = 0.0f;
+            r = 0.0f;
+            for (int b = 0; b < Impl::NUM_BANDS; ++b) {
+                filters[b].reset();
+            }
         }
 
         if (limit) {

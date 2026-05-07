@@ -169,6 +169,93 @@ bool invalidParameterSafety(TestFailure& failure) {
     return true;
 }
 
+bool nonFinitePcmInputDoesNotPoisonState(TestFailure& failure) {
+    const float badValues[] = {
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+    };
+
+    for (float badValue : badValues) {
+        FineTuneEQEngine engine(kSampleRate);
+        engine.updateConfig(makeTwentyBandConfig());
+
+        const int frames = 1024;
+        const auto normal = makeStereoSine(frames, 997.0f, 0.25f);
+
+        std::vector<float> warmupOut(normal.size(), 0.0f);
+        engine.process(normal.data(), warmupOut.data(), frames);
+        if (!isFiniteBuffer(warmupOut)) {
+            failure = {"non-finite PCM input recovery", "normal warmup output contains NaN or Inf"};
+            return false;
+        }
+
+        auto badInput = normal;
+        badInput[0] = badValue;
+        badInput[1] = -badValue;
+        std::vector<float> badOut(badInput.size(), 0.0f);
+        engine.process(badInput.data(), badOut.data(), frames);
+        if (!isFiniteBuffer(badOut)) {
+            failure = {"non-finite PCM input recovery", "bad PCM input leaked NaN or Inf to output"};
+            return false;
+        }
+        if (maxAbs(badOut) > 1.01f) {
+            failure = {"non-finite PCM input recovery", "bad PCM input exceeded limiter tolerance"};
+            return false;
+        }
+
+        std::vector<float> recoveryOut(normal.size(), 0.0f);
+        engine.process(normal.data(), recoveryOut.data(), frames);
+        if (!isFiniteBuffer(recoveryOut)) {
+            failure = {"non-finite PCM input recovery", "filter state stayed poisoned after bad PCM input"};
+            return false;
+        }
+        if (maxAbs(recoveryOut) > 1.01f) {
+            failure = {"non-finite PCM input recovery", "recovery output exceeded limiter tolerance"};
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool nonFiniteCascadeOutputResetsState(TestFailure& failure) {
+    FineTuneEQEngine engine(kSampleRate);
+
+    EqEngineConfig config;
+    config.preampDB = 0.0f;
+    config.enableSoftLimiter = true;
+    config.bands.push_back({EqFilterType::PEAKING, 1000.0f, 24.0f, 1.0f});
+    engine.updateConfig(config);
+
+    constexpr int frames = 64;
+    std::vector<float> overload(static_cast<size_t>(frames) * 2U, 0.0f);
+    overload[0] = std::numeric_limits<float>::max();
+    overload[1] = -std::numeric_limits<float>::max();
+
+    std::vector<float> overloadOut(overload.size(), 0.0f);
+    engine.process(overload.data(), overloadOut.data(), frames);
+    if (!isFiniteBuffer(overloadOut)) {
+        failure = {"non-finite cascade output reset", "overflowing finite PCM leaked NaN or Inf to output"};
+        return false;
+    }
+
+    const int recoveryFrames = 1024;
+    const auto recovery = makeStereoSine(recoveryFrames, 997.0f, 0.2f);
+    std::vector<float> recoveryOut(recovery.size(), 0.0f);
+    engine.process(recovery.data(), recoveryOut.data(), recoveryFrames);
+    if (!isFiniteBuffer(recoveryOut)) {
+        failure = {"non-finite cascade output reset", "filter state stayed poisoned after overflow recovery reset"};
+        return false;
+    }
+    if (maxAbs(recoveryOut) > 1.01f) {
+        failure = {"non-finite cascade output reset", "recovery output exceeded limiter tolerance"};
+        return false;
+    }
+
+    return true;
+}
+
 bool inPlaceOutOfPlaceEquivalence(TestFailure& failure) {
     FineTuneEQEngine inPlaceEngine(kSampleRate);
     FineTuneEQEngine outOfPlaceEngine(kSampleRate);
@@ -488,6 +575,8 @@ int main() {
         pipelineSmoke,
         emptyConfigRemovesStaleFilters,
         invalidParameterSafety,
+        nonFinitePcmInputDoesNotPoisonState,
+        nonFiniteCascadeOutputResetsState,
         inPlaceOutOfPlaceEquivalence,
         autoPreampImmediateForPlus12dB,
         wrapperClampAndEquivalence,
