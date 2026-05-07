@@ -1,5 +1,7 @@
 <div align="center">
 
+<img width="2752" height="1536" alt="스마트폰용 초강력 20밴드 EQ 모듈" src="https://github.com/user-attachments/assets/6da86bae-76e4-4f2d-bca7-68fa92db2401" />
+
 # 🎧 Android 20-Band Parametric EQ Module
 
 [![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](https://en.cppreference.com/w/cpp/17)
