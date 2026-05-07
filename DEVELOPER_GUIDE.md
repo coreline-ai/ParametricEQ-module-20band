@@ -13,6 +13,7 @@
 - JNI `AudioEngineJNI` binding
 - Direct `ByteBuffer` 기반 Float32 stereo PCM in-place 처리
 - `computeAutoPreampDB()` 기반 권장 preamp 계산
+- `44100Hz ~ 384000Hz` same-rate DSP 계약
 
 범위 밖:
 
@@ -20,6 +21,7 @@
 - Dynamic EQ 구현
 - Oboe player 구현
 - Android UI/slider 화면 구현
+- Resampling / upsampling / downsampling 구현
 
 Linear-phase/Dynamic EQ는 Parametric EQ와의 비교 또는 제외 범위 설명에만 사용할 수 있습니다. 이 문서에서는 추가 구현 계획으로 다루지 않습니다.
 
@@ -46,7 +48,7 @@ import java.nio.ByteBuffer
 class AudioEngineJNI {
     init { System.loadLibrary("audioengine_jni") }
 
-    external fun init(sampleRate: Int)
+    external fun init(sampleRate: Int) // 44100~384000Hz, 실제 PCM sampleRate와 동일해야 함
     external fun release()
 
     external fun updateConfig(
@@ -70,10 +72,62 @@ class AudioEngineJNI {
 - 20개보다 적은 입력은 나머지 band를 flat/bypass로 다루는 방향이어야 합니다.
 - `filterTypes` 값은 `0=PEAKING`, `1=LOW_SHELF`, `2=HIGH_SHELF` Parametric EQ 범위 안에서만 사용합니다.
 - `qFactors`의 의미는 filter type에 따라 다릅니다. `PEAKING`은 Q factor이고, `LOW_SHELF`/`HIGH_SHELF`는 RBJ Cookbook의 shelf slope `S`로 해석합니다.
+- `processDirectBuffer(buffer, numFrames)`는 sampleRate 인자를 받지 않습니다. `init(sampleRate)` 값이 coefficient 계산의 유일한 sampleRate 기준입니다.
 
 ---
 
-## 3. Wrapper Input Structure Target
+## 3. Sample-rate Contract
+
+이 모듈은 sample-rate converter가 아니라 **same-rate IIR EQ core**입니다.
+
+```text
+decoder/output PCM sampleRate
+  == AudioEngineJNI.init(sampleRate)
+  == FineTuneEQEngine(sampleRate)
+  == AudioTrack/Oboe/AAudio output sampleRate
+```
+
+정책:
+
+- 지원 범위는 `44100Hz <= sampleRate <= 384000Hz`입니다.
+- `NaN`, `Inf`, `0`, 음수, `44100Hz` 미만, `384000Hz` 초과 입력은 core에서 `48000Hz`로 fallback합니다.
+- EQ는 입력 frame 수와 동일한 frame 수만 처리합니다. resampling/upsampling/downsampling은 하지 않습니다.
+- RBJ coefficient는 `w0 = 2πf / sampleRate`로 계산되므로, 실제 PCM sampleRate와 engine sampleRate가 다르면 EQ 중심 주파수가 틀어집니다.
+- `frequency >= sampleRate / 2`인 band는 안전하게 flat coefficient로 처리됩니다.
+
+Android 권장 절차:
+
+```kotlin
+val actualPcmSampleRate = decodedFormat.sampleRate // 예: MediaFormat.KEY_SAMPLE_RATE
+
+// Audio output도 같은 sampleRate로 협상/생성
+// AudioTrack.Builder()
+//   .setAudioFormat(
+//       AudioFormat.Builder()
+//           .setSampleRate(actualPcmSampleRate)
+//           .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+//           .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+//           .build()
+//   )
+
+engine.init(actualPcmSampleRate)
+engine.updateConfig(...)
+engine.processDirectBuffer(floatStereoDirectBuffer, numFrames)
+```
+
+곡/stream sampleRate가 바뀌는 경우:
+
+```text
+release()
+init(newActualPcmSampleRate)
+updateConfig(currentPreset)
+```
+
+이번 범위에서는 재생 중 sampleRate만 바꾸는 `setSampleRate()` API를 추가하지 않습니다. sampleRate 변경은 coefficient와 delay state 의미를 바꾸므로 engine 재초기화가 가장 안전합니다.
+
+---
+
+## 4. Wrapper Input Structure Target
 
 새 wrapper 입력 구조의 목표는 Kotlin/UI 계층에서 온 고정 배열 값을 core config로 변환하는 adapter contract를 명확히 하는 것입니다.
 
@@ -112,7 +166,7 @@ Wrapper fixed arrays
 
 ---
 
-## 4. Preamp Policy
+## 5. Preamp Policy
 
 Preamp는 “가장 큰 band gain이 +5 dB이므로 -5 dB를 넣는다” 같은 단순 규칙으로 설명하지 않습니다.
 
@@ -126,7 +180,7 @@ Preamp는 “가장 큰 band gain이 +5 dB이므로 -5 dB를 넣는다” 같은
 
 ---
 
-## 5. JNI Class Path and RegisterNatives
+## 6. JNI Class Path and RegisterNatives
 
 C++ bridge는 `JNI_OnLoad`에서 `RegisterNatives`를 사용합니다.
 
@@ -157,7 +211,7 @@ android {
 
 ---
 
-## 6. Build and Verification Notes
+## 7. Build and Verification Notes
 
 Android NDK build 예시:
 
@@ -190,19 +244,20 @@ cmake --build build/host -j
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | 증상 | 확인 사항 |
 |---|---|
 | `UnsatisfiedLinkError` | Kotlin class path와 `EQ_JNI_CLASS_PATH` 일치 여부, `System.loadLibrary("audioengine_jni")` 호출 여부 |
 | EQ 적용 후 clipping | `computeAutoPreampDB()` 기반 preamp를 적용했는지 확인 |
+| EQ 중심 주파수가 예상과 다름 | decoder/output PCM sampleRate와 `init(sampleRate)` 값이 같은지 확인 |
 | 설정 변경 시 click/pop | 엔진 재생성 대신 기존 instance에 `updateConfig(...)`만 호출하는지 확인 |
 | 배열 입력 오류 | 4개 배열이 모두 준비되었는지, 20-band cap 정책과 null/길이 검증을 통과하는지 확인 |
 | PCM 처리 실패 | `ByteBuffer.allocateDirect(...)`, native byte order, `numFrames * 2 * sizeof(float)` capacity 확인 |
 
 ---
 
-## 8. Documentation Rules for Parallel Work
+## 9. Documentation Rules for Parallel Work
 
 - 이 문서는 Parametric EQ wrapper/core adapter 범위만 기술합니다.
 - Linear-phase EQ, Dynamic EQ, Oboe player, UI 구현을 roadmap 또는 추가 계획으로 넣지 않습니다.

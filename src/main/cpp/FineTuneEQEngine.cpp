@@ -16,6 +16,10 @@ constexpr float kDefault20BandFrequencies[Eq20BandInput::NUM_BANDS] = {
     5656.85f, 8000.0f, 11313.71f, 16000.0f, 20000.0f
 };
 
+constexpr double kMinSupportedSampleRate = 44100.0;
+constexpr double kMaxSupportedSampleRate = 384000.0;
+constexpr double kFallbackSampleRate = 48000.0;
+
 inline float finiteOr(float value, float fallback) {
     return std::isfinite(value) ? value : fallback;
 }
@@ -205,10 +209,14 @@ public:
 // --- FineTuneEQEngine Methods ---
 
 FineTuneEQEngine::FineTuneEQEngine(double sampleRate) {
-    // Reject obviously invalid sample rates so the rest of the engine can
-    // assume fs > 0, finite, and within typical audio device range.
-    if (!std::isfinite(sampleRate) || sampleRate < 8000.0 || sampleRate > 384000.0) {
-        sampleRate = 48000.0;
+    // Same-rate DSP contract:
+    //   input PCM sampleRate == engine sampleRate == output PCM sampleRate.
+    // This module is not a sample-rate converter. Unsupported/invalid rates
+    // fall back to 48 kHz so the coefficient path remains finite and safe.
+    if (!std::isfinite(sampleRate) ||
+        sampleRate < kMinSupportedSampleRate ||
+        sampleRate > kMaxSupportedSampleRate) {
+        sampleRate = kFallbackSampleRate;
     }
     pImpl = new Impl(sampleRate);
 }

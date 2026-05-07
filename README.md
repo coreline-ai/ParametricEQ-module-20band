@@ -56,6 +56,8 @@ RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct 
 
 - **포함**: `PEAKING`, `LOW_SHELF`, `HIGH_SHELF` biquad cascade, preamp, soft limiter, JNI bridge, fixed-width wrapper input
 - **제외**: Linear-phase EQ, Dynamic EQ, Oboe player 구현, Android UI 구현
+- **Sample-rate 계약**: `44100Hz ~ 384000Hz` same-rate DSP. `input PCM sampleRate == FineTuneEQEngine sampleRate == output PCM sampleRate`
+- **Resampling 제외**: 본 모듈은 sample-rate converter가 아니며, upsampling/downsampling을 수행하지 않습니다.
 - Linear-phase / Dynamic EQ는 비교 대상 또는 제외 범위로만 언급되며, 본 문서의 구현 계획에 포함되지 않습니다.
 
 ---
@@ -103,7 +105,7 @@ RBJ Audio EQ Cookbook 표준 수식 · Stereo interleaved Float32 · JNI Direct 
 | **Lifecycle UAF 차단** | Atomic engine pointer + in-flight counter drain pattern. `init/release/updateConfig/processDirectBuffer/computeAutoPreampDB` **모든 경로** 보호 |
 | **Data race 부재** | `computeAutoPreampDB`가 audio thread 활성 상태 대신 config-side snapshot을 mutex로 보호 |
 | **부분 config = 진짜 bypass** | `bands.size() < 20`이면 나머지 필터는 자동으로 unity 계수 (stale 계수 잔존 0) |
-| **입력 sanitization** | NaN/Inf/Q≤0/잘못된 sampleRate 모두 안전한 fallback (flat coeff 또는 기본값) |
+| **입력 sanitization** | NaN/Inf/Q≤0/지원 범위 밖 sampleRate 모두 안전한 fallback (flat coeff 또는 48kHz 기본값) |
 
 ### 🔌 JNI Hardening
 
@@ -212,8 +214,9 @@ class AudioEngineJNI {
 }
 
 // --- 사용 예 ---
+val actualPcmSampleRate = 48000 // decoder/AudioTrack/engine 모두 동일해야 함
 val engine = AudioEngineJNI()
-engine.init(48000)
+engine.init(actualPcmSampleRate)
 
 engine.updateConfig(
     preampDB       = 0f,
@@ -241,7 +244,8 @@ engine.processDirectBuffer(buffer, numFrames)
 ```cpp
 #include "FineTuneEQEngine.h"
 
-FineTuneEQEngine eq(48000.0);
+const double actualPcmSampleRate = 48000.0; // input/output PCM과 동일해야 함
+FineTuneEQEngine eq(actualPcmSampleRate);
 
 // 방법 A: EqEngineConfig (가변 길이 vector)
 EqEngineConfig cfg;
@@ -304,7 +308,7 @@ AndroidEQModule/
 
 | 메서드 | 시그니처 | 호출 스레드 | 설명 |
 |---|---|---|---|
-| ctor | `FineTuneEQEngine(double sampleRate)` | UI/init | `[8000, 384000]` 외 입력은 48000으로 fallback |
+| ctor | `FineTuneEQEngine(double sampleRate)` | UI/init | `[44100, 384000]` 외 입력은 48000으로 fallback |
 | `updateConfig` | `void updateConfig(const EqEngineConfig&)` | UI | 가변 길이 vector. NOT_RT_SAFE |
 | `updateConfig` | `void updateConfig(const Eq20BandInput&)` | UI | 고정 20개 wrapper. clamp 정책 자동 적용 |
 | `process` | `void process(const float* in, float* out, int numFrames)` | **오디오 콜백** | RT-safe. `in == out` (in-place) 허용 |
@@ -350,9 +354,9 @@ NDK r27 / API-24 기준 빌드 결과 (Release):
 
 | ABI | `libaudioengine_jni.so` |
 |---|---|
-| `arm64-v8a` | ✅ ~830 KB |
-| `armeabi-v7a` | ✅ ~600 KB |
-| `x86_64` | ✅ ~720 KB |
+| `arm64-v8a` | ✅ ~811 KB |
+| `armeabi-v7a` | ✅ ~613 KB |
+| `x86_64` | ✅ ~734 KB |
 
 ### 호스트 standalone 빌드 (회귀 테스트)
 
@@ -382,7 +386,7 @@ cmake --build build/android-arm64 -j
 
 ## 🧪 Verification & Quality Gates
 
-`standalone_test` 6개 테스트가 핵심 동작을 회귀 검증합니다:
+`standalone_test` 10개 테스트가 핵심 동작을 회귀 검증합니다:
 
 | # | 테스트 | 검증 항목 |
 |---|---|---|
@@ -392,6 +396,10 @@ cmake --build build/android-arm64 -j
 | 4 | `inPlaceOutOfPlaceEquivalence` | `process(buf,buf)` ≡ `process(in,out)` (max diff < 1e-6) |
 | 5 | `autoPreampImmediateForPlus12dB` | `updateConfig` 직후 `computeAutoPreampDB()` 반환값이 `[-13.5, -10.5] dB` 범위 |
 | 6 | `wrapperClampAndEquivalence` | `Eq20BandInput`의 gainMin/Max·qMin/Max clamp + `updateConfig(Eq20BandInput) ≡ updateConfig(makeEqEngineConfig(input))` |
+| 7 | `sampleRateSupportMatrix` | 44.1k/48k/88.2k/96k/176.4k/192k/352.8k/384kHz에서 finite output + finite auto preamp |
+| 8 | `unsupportedSampleRateFallsBackTo48000` | 44099/384001/NaN/Inf/0/-1Hz 입력이 48kHz fallback 출력과 동일 |
+| 9 | `sameRateNoResamplingFrameInvariant` | 44100/48000/384000Hz에서 `numFrames`로 지정한 stereo sample 영역만 기록 |
+| 10 | `nyquistFrequencyPolicy` | 44.1kHz에서 20kHz band 유효, 23kHz band flat 처리, 384kHz에서 100kHz band finite |
 
 ### Sanitizer 결과
 
@@ -409,7 +417,8 @@ cmake --build build/android-arm64 -j
 |---|---|
 | 채널 | Stereo interleaved (L, R, L, R…) |
 | 샘플 포맷 | Float32 (`-1.0 ~ +1.0`) |
-| 지원 sampleRate | 8000 ~ 384000 Hz (그 외 입력은 48000으로 fallback) |
+| 지원 sampleRate | 44100 ~ 384000 Hz (그 외 입력은 48000으로 fallback) |
+| sampleRate 처리 | Same-rate DSP only. 입력 PCM sampleRate = engine sampleRate = 출력 PCM sampleRate. Resampling 없음 |
 | 밴드 수 | 20 (고정) |
 | Q / S 범위 | 실용 0.05 ~ 100+ (0.05 미만은 0.05로 클램프) |
 | Gain 범위 | 무제한 (NaN/Inf만 차단; preamp 자동 산출 권장) |
@@ -426,6 +435,7 @@ cmake --build build/android-arm64 -j
 | 증상 | 빠른 진단 |
 |---|---|
 | 소리가 찢어짐 (clipping) | `AudioFormat.ENCODING_PCM_FLOAT` 사용? `computeAutoPreampDB()` 적용? |
+| EQ 중심 주파수가 어긋남 | decoder/AudioTrack 실제 sampleRate와 `engine.init(sampleRate)` 값이 같은지 확인 |
 | 슬라이더 드래그 시 click | C++ 엔진을 매번 재생성하지 않는지 확인 — `updateConfig`만 다시 호출 |
 | `UnsatisfiedLinkError` | Kotlin 클래스명이 `AudioEngineJNI`인지 확인. 또는 `-DEQ_JNI_CLASS_PATH=...` 빌드 옵션 |
 | `init/release` 토글 시 크래시 | 현재 버전은 ProcessGuard drain pattern으로 차단됨. 이전 버전이면 업데이트 |

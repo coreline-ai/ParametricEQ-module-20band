@@ -32,15 +32,27 @@ float maxAbs(const std::vector<float>& buffer) {
     return peak;
 }
 
-std::vector<float> makeStereoSine(int frames, float frequency, float amplitude) {
+std::vector<float> makeStereoSine(int frames,
+                                  float frequency,
+                                  float amplitude,
+                                  double sampleRate = kSampleRate) {
     std::vector<float> pcm(static_cast<size_t>(frames) * 2U);
     for (int i = 0; i < frames; ++i) {
         const float s = amplitude * std::sin(2.0f * kPi * frequency * static_cast<float>(i) /
-                                             static_cast<float>(kSampleRate));
+                                             static_cast<float>(sampleRate));
         pcm[static_cast<size_t>(2 * i)] = s;
         pcm[static_cast<size_t>(2 * i + 1)] = -0.75f * s;
     }
     return pcm;
+}
+
+float maxDiff(const std::vector<float>& a, const std::vector<float>& b) {
+    const size_t n = std::min(a.size(), b.size());
+    float diff = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        diff = std::max(diff, std::fabs(a[i] - b[i]));
+    }
+    return diff;
 }
 
 EqEngineConfig makeTwentyBandConfig() {
@@ -263,6 +275,212 @@ bool wrapperClampAndEquivalence(TestFailure& failure) {
     return true;
 }
 
+bool sampleRateSupportMatrix(TestFailure& failure) {
+    const double sampleRates[] = {
+        44100.0, 48000.0, 88200.0, 96000.0,
+        176400.0, 192000.0, 352800.0, 384000.0
+    };
+
+    for (double sampleRate : sampleRates) {
+        FineTuneEQEngine engine(sampleRate);
+        engine.updateConfig(makeTwentyBandConfig());
+
+        const int frames = 1024;
+        const auto input = makeStereoSine(frames, 997.0f, 0.35f, sampleRate);
+        std::vector<float> output(input.size(), 0.0f);
+        engine.process(input.data(), output.data(), frames);
+
+        const float autoPreampDB = engine.computeAutoPreampDB();
+        if (!isFiniteBuffer(output)) {
+            failure = {"sample-rate support matrix", "non-finite output at " + std::to_string(sampleRate) + " Hz"};
+            return false;
+        }
+        if (!std::isfinite(autoPreampDB)) {
+            failure = {"sample-rate support matrix", "non-finite auto preamp at " + std::to_string(sampleRate) + " Hz"};
+            return false;
+        }
+        if (maxAbs(output) > 1.01f) {
+            failure = {"sample-rate support matrix", "limiter peak exceeded at " + std::to_string(sampleRate) +
+                                                     " Hz: " + std::to_string(maxAbs(output))};
+            return false;
+        }
+
+        Eq20BandInput wrapper;
+        wrapper.gains[10] = 3.0f;
+        wrapper.qFactors[10] = 1.2f;
+        engine.updateConfig(wrapper);
+        std::fill(output.begin(), output.end(), 0.0f);
+        engine.process(input.data(), output.data(), frames);
+        if (!isFiniteBuffer(output)) {
+            failure = {"sample-rate support matrix", "wrapper preset non-finite output at " +
+                                                     std::to_string(sampleRate) + " Hz"};
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool unsupportedSampleRateFallsBackTo48000(TestFailure& failure) {
+    const double unsupportedRates[] = {
+        44099.0,
+        384001.0,
+        std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity(),
+        0.0,
+        -1.0
+    };
+
+    EqEngineConfig config = makeTwentyBandConfig();
+    config.preampDB = 0.0f;
+    config.enableSoftLimiter = false;
+
+    const int frames = 2048;
+    const auto input = makeStereoSine(frames, 1234.0f, 0.05f, 48000.0);
+
+    for (double unsupportedRate : unsupportedRates) {
+        FineTuneEQEngine unsupportedEngine(unsupportedRate);
+        FineTuneEQEngine referenceEngine(48000.0);
+        unsupportedEngine.updateConfig(config);
+        referenceEngine.updateConfig(config);
+
+        std::vector<float> unsupportedOut(input.size(), 0.0f);
+        std::vector<float> referenceOut(input.size(), 0.0f);
+        unsupportedEngine.process(input.data(), unsupportedOut.data(), frames);
+        referenceEngine.process(input.data(), referenceOut.data(), frames);
+
+        if (!isFiniteBuffer(unsupportedOut)) {
+            failure = {"unsupported sample-rate fallback", "non-finite output for unsupported sampleRate"};
+            return false;
+        }
+        const float diff = maxDiff(unsupportedOut, referenceOut);
+        if (diff > 1.0e-6f) {
+            failure = {"unsupported sample-rate fallback", "unsupported sampleRate did not match 48 kHz fallback; max diff=" +
+                                                            std::to_string(diff)};
+            return false;
+        }
+
+        const float unsupportedAuto = unsupportedEngine.computeAutoPreampDB();
+        const float referenceAuto = referenceEngine.computeAutoPreampDB();
+        if (!std::isfinite(unsupportedAuto) || std::fabs(unsupportedAuto - referenceAuto) > 1.0e-5f) {
+            failure = {"unsupported sample-rate fallback", "auto preamp did not match 48 kHz fallback"};
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool sameRateNoResamplingFrameInvariant(TestFailure& failure) {
+    struct Case {
+        double sampleRate;
+        int frames;
+    };
+
+    const Case cases[] = {
+        {44100.0, 1024},
+        {48000.0, 480},
+        {384000.0, 256}
+    };
+
+    constexpr float kSentinel = -12345.0f;
+    constexpr size_t kGuardSamples = 16;
+
+    for (const auto& c : cases) {
+        FineTuneEQEngine engine(c.sampleRate);
+        EqEngineConfig config = makeTwentyBandConfig();
+        engine.updateConfig(config);
+
+        const auto input = makeStereoSine(c.frames, 440.0f, 0.2f, c.sampleRate);
+        std::vector<float> output(input.size() + kGuardSamples, kSentinel);
+        engine.process(input.data(), output.data(), c.frames);
+
+        std::vector<float> written(output.begin(), output.begin() + static_cast<long>(input.size()));
+        if (!isFiniteBuffer(written)) {
+            failure = {"same-rate no-resampling frame invariant", "non-finite written region at " +
+                                                                 std::to_string(c.sampleRate) + " Hz"};
+            return false;
+        }
+        for (size_t i = input.size(); i < output.size(); ++i) {
+            if (output[i] != kSentinel) {
+                failure = {"same-rate no-resampling frame invariant", "wrote beyond numFrames at " +
+                                                                     std::to_string(c.sampleRate) + " Hz"};
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool nyquistFrequencyPolicy(TestFailure& failure) {
+    {
+        FineTuneEQEngine engine(44100.0);
+        EqEngineConfig config;
+        config.enableSoftLimiter = false;
+        config.bands.push_back({EqFilterType::PEAKING, 23000.0f, 12.0f, 1.0f});
+        engine.updateConfig(config);
+
+        const int frames = 1024;
+        const auto input = makeStereoSine(frames, 1000.0f, 0.2f, 44100.0);
+        std::vector<float> output(input.size(), 0.0f);
+        engine.process(input.data(), output.data(), frames);
+
+        const float diff = maxDiff(input, output);
+        if (!isFiniteBuffer(output)) {
+            failure = {"nyquist frequency policy", "23 kHz / 44.1 kHz invalid band produced non-finite output"};
+            return false;
+        }
+        if (diff > 1.0e-6f) {
+            failure = {"nyquist frequency policy", "frequency >= Nyquist should become flat; max diff=" +
+                                                   std::to_string(diff)};
+            return false;
+        }
+    }
+
+    {
+        FineTuneEQEngine engine(44100.0);
+        EqEngineConfig config;
+        config.enableSoftLimiter = false;
+        config.bands.push_back({EqFilterType::PEAKING, 20000.0f, 6.0f, 1.0f});
+        engine.updateConfig(config);
+
+        const int frames = 2048;
+        const auto input = makeStereoSine(frames, 20000.0f, 0.05f, 44100.0);
+        std::vector<float> output(input.size(), 0.0f);
+        engine.process(input.data(), output.data(), frames);
+
+        const float diff = maxDiff(input, output);
+        if (!isFiniteBuffer(output)) {
+            failure = {"nyquist frequency policy", "20 kHz / 44.1 kHz valid band produced non-finite output"};
+            return false;
+        }
+        if (diff < 1.0e-4f) {
+            failure = {"nyquist frequency policy", "20 kHz / 44.1 kHz valid band looked unexpectedly flat"};
+            return false;
+        }
+    }
+
+    {
+        FineTuneEQEngine engine(384000.0);
+        EqEngineConfig config;
+        config.enableSoftLimiter = false;
+        config.bands.push_back({EqFilterType::PEAKING, 100000.0f, 3.0f, 1.0f});
+        engine.updateConfig(config);
+
+        const int frames = 1024;
+        const auto input = makeStereoSine(frames, 100000.0f, 0.05f, 384000.0);
+        std::vector<float> output(input.size(), 0.0f);
+        engine.process(input.data(), output.data(), frames);
+        if (!isFiniteBuffer(output)) {
+            failure = {"nyquist frequency policy", "100 kHz / 384 kHz valid band produced non-finite output"};
+            return false;
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -273,6 +491,10 @@ int main() {
         inPlaceOutOfPlaceEquivalence,
         autoPreampImmediateForPlus12dB,
         wrapperClampAndEquivalence,
+        sampleRateSupportMatrix,
+        unsupportedSampleRateFallsBackTo48000,
+        sameRateNoResamplingFrameInvariant,
+        nyquistFrequencyPolicy,
     };
 
     for (auto test : tests) {
