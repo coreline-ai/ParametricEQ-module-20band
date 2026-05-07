@@ -9,7 +9,7 @@ out/
 *.exe
 
 # Working notes / scratch
-dev-plan/
+#dev-plan/
 
 # IDE
 .idea/
