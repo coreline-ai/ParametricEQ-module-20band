@@ -28,6 +28,37 @@ struct EqEngineConfig {
     std::vector<EqBandConfig> bands;
 };
 
+// Fixed-width 20-band wrapper input used by UI/JNI layers that expose
+// slider arrays instead of an owned std::vector. gainMin/gainMax and
+// qMin/qMax are clamp-policy bounds only; they do not change the EQ
+// algorithm or coefficient formulas. Defaults represent a flat 20-band
+// preset: 0 dB gains, PEAKING bands, sane frequencies, and neutral preamp.
+struct Eq20BandInput {
+    static constexpr int NUM_BANDS = 20;
+
+    float gainMin = -12.0f;
+    float gainMax =  12.0f;
+    float gains[NUM_BANDS];
+
+    float qMin = 0.05f;
+    float qMax = 10.0f;
+    float qFactors[NUM_BANDS];
+
+    float frequencies[NUM_BANDS];
+    EqFilterType filterTypes[NUM_BANDS];
+
+    float preampDB = 0.0f;
+    bool enableSoftLimiter = true;
+
+    Eq20BandInput();
+};
+
+// Convert the fixed-width wrapper to the engine's existing vector config.
+// Per-band gains and qFactors are clamped to the wrapper's min/max policy
+// before coefficient generation; frequencies remain subject to the existing
+// sanitize path in updateConfig().
+EqEngineConfig makeEqEngineConfig(const Eq20BandInput& input);
+
 class FineTuneEQEngine {
 public:
     FineTuneEQEngine(double sampleRate);
@@ -36,6 +67,7 @@ public:
     // Update the engine configuration (thread-safe for single producer/consumer).
     // NOT_RT_SAFE — call from configuration thread; allocates and computes coeffs.
     void updateConfig(const EqEngineConfig& config);
+    void updateConfig(const Eq20BandInput& input);
 
     // Core DSP processing for interleaved stereo Float32 buffers.
     // Handles Preamp -> 20-Band Biquad Cascade -> Soft Limiter.

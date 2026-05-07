@@ -9,19 +9,69 @@
 
 namespace {
 
+constexpr float kDefault20BandFrequencies[Eq20BandInput::NUM_BANDS] = {
+    31.25f, 44.19f, 62.5f, 88.39f, 125.0f,
+    176.78f, 250.0f, 353.55f, 500.0f, 707.11f,
+    1000.0f, 1414.21f, 2000.0f, 2828.43f, 4000.0f,
+    5656.85f, 8000.0f, 11313.71f, 16000.0f, 20000.0f
+};
+
+inline float finiteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
+
+inline float clampWithPolicy(float value, float minValue, float maxValue) {
+    if (minValue > maxValue) {
+        std::swap(minValue, maxValue);
+    }
+    return std::max(minValue, std::min(value, maxValue));
+}
+
 // Returns true if all four inputs are finite and within usable RBJ ranges.
-// Out-of-range inputs cause the caller to substitute a flat (unity) coefficient
-// set so a single bad slider value cannot poison the entire cascade with NaN.
-inline bool sanitizeBandInputs(float& f, float& g, float& Q, double fs) {
-    if (!std::isfinite(f) || !std::isfinite(g) || !std::isfinite(Q)) return false;
+// The third parameter is RBJ Q for peaking filters, but RBJ shelf slope S for
+// low/high shelf filters. Out-of-range inputs cause the caller to substitute a
+// flat (unity) coefficient set so one bad slider cannot poison the cascade.
+inline bool sanitizeBandInputs(float& f, float& g, float& qOrShelfSlope, double fs) {
+    if (!std::isfinite(f) || !std::isfinite(g) || !std::isfinite(qOrShelfSlope)) return false;
     if (!(fs > 0.0)) return false;
     const double nyquist = fs * 0.5;
     if (f <= 0.0f || static_cast<double>(f) >= nyquist) return false;
-    if (Q < 0.05f) Q = 0.05f;   // policy minimum; below this RBJ alpha blows up
+    if (qOrShelfSlope < 0.05f) qOrShelfSlope = 0.05f;   // policy minimum; below this RBJ alpha blows up
     return true;
 }
 
 } // namespace
+
+Eq20BandInput::Eq20BandInput() {
+    for (int i = 0; i < NUM_BANDS; ++i) {
+        gains[i] = 0.0f;
+        qFactors[i] = 0.707f;
+        frequencies[i] = kDefault20BandFrequencies[i];
+        filterTypes[i] = EqFilterType::PEAKING;
+    }
+}
+
+EqEngineConfig makeEqEngineConfig(const Eq20BandInput& input) {
+    EqEngineConfig config;
+    config.preampDB = finiteOr(input.preampDB, 0.0f);
+    config.enableSoftLimiter = input.enableSoftLimiter;
+    config.bands.reserve(Eq20BandInput::NUM_BANDS);
+
+    const float gainMin = finiteOr(input.gainMin, -12.0f);
+    const float gainMax = finiteOr(input.gainMax,  12.0f);
+    const float qMin = finiteOr(input.qMin, 0.05f);
+    const float qMax = finiteOr(input.qMax, 10.0f);
+
+    for (int i = 0; i < Eq20BandInput::NUM_BANDS; ++i) {
+        EqBandConfig band;
+        band.type = input.filterTypes[i];
+        band.frequency = finiteOr(input.frequencies[i], kDefault20BandFrequencies[i]);
+        band.gainDB = clampWithPolicy(finiteOr(input.gains[i], 0.0f), gainMin, gainMax);
+        band.qFactor = clampWithPolicy(finiteOr(input.qFactors[i], 0.707f), qMin, qMax);
+        config.bands.push_back(band);
+    }
+    return config;
+}
 
 // --- Helper: Biquad Math for Peaking EQ ---
 static BiquadCoeffs calculatePeakingCoeffs(float frequency, float gainDB, float qFactor, double sampleRate) {
@@ -47,14 +97,19 @@ static BiquadCoeffs calculatePeakingCoeffs(float frequency, float gainDB, float 
     return coeffs;
 }
 
-static BiquadCoeffs calculateLowShelfCoeffs(float frequency, float gainDB, float qFactor, double sampleRate) {
+static BiquadCoeffs calculateLowShelfCoeffs(float frequency, float gainDB, float shelfSlope, double sampleRate) {
     BiquadCoeffs coeffs;
-    if (!sanitizeBandInputs(frequency, gainDB, qFactor, sampleRate)) return coeffs;
+    if (!sanitizeBandInputs(frequency, gainDB, shelfSlope, sampleRate)) return coeffs;
 
-    double A = std::pow(10.0, gainDB / 40.0);
-    double w0 = 2.0 * M_PI * frequency / sampleRate;
-    double alpha = std::sin(w0) / (2.0 * qFactor);
-    double sqrtA = std::sqrt(A);
+    const double A = std::pow(10.0, gainDB / 40.0);
+    const double w0 = 2.0 * M_PI * frequency / sampleRate;
+    const double sqrtA = std::sqrt(A);
+    // RBJ Audio EQ Cookbook shelf formula: qFactor is intentionally interpreted
+    // as shelf slope S here, not peaking-EQ Q. S controls transition steepness;
+    // gainMin/gainMax and qMin/qMax wrapper fields only clamp incoming values.
+    const double slopeTerm = (A + 1.0 / A) * (1.0 / shelfSlope - 1.0) + 2.0;
+    if (slopeTerm < 0.0) return coeffs;
+    const double alpha = std::sin(w0) * 0.5 * std::sqrt(slopeTerm);
 
     double b0 = A * ((A + 1.0) - (A - 1.0) * std::cos(w0) + 2.0 * sqrtA * alpha);
     double b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * std::cos(w0));
@@ -71,14 +126,19 @@ static BiquadCoeffs calculateLowShelfCoeffs(float frequency, float gainDB, float
     return coeffs;
 }
 
-static BiquadCoeffs calculateHighShelfCoeffs(float frequency, float gainDB, float qFactor, double sampleRate) {
+static BiquadCoeffs calculateHighShelfCoeffs(float frequency, float gainDB, float shelfSlope, double sampleRate) {
     BiquadCoeffs coeffs;
-    if (!sanitizeBandInputs(frequency, gainDB, qFactor, sampleRate)) return coeffs;
+    if (!sanitizeBandInputs(frequency, gainDB, shelfSlope, sampleRate)) return coeffs;
 
-    double A = std::pow(10.0, gainDB / 40.0);
-    double w0 = 2.0 * M_PI * frequency / sampleRate;
-    double alpha = std::sin(w0) / (2.0 * qFactor);
-    double sqrtA = std::sqrt(A);
+    const double A = std::pow(10.0, gainDB / 40.0);
+    const double w0 = 2.0 * M_PI * frequency / sampleRate;
+    const double sqrtA = std::sqrt(A);
+    // RBJ Audio EQ Cookbook shelf formula: qFactor is intentionally interpreted
+    // as shelf slope S here, not peaking-EQ Q. S controls transition steepness;
+    // gainMin/gainMax and qMin/qMax wrapper fields only clamp incoming values.
+    const double slopeTerm = (A + 1.0 / A) * (1.0 / shelfSlope - 1.0) + 2.0;
+    if (slopeTerm < 0.0) return coeffs;
+    const double alpha = std::sin(w0) * 0.5 * std::sqrt(slopeTerm);
 
     double b0 = A * ((A + 1.0) + (A - 1.0) * std::cos(w0) + 2.0 * sqrtA * alpha);
     double b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * std::cos(w0));
@@ -155,6 +215,10 @@ FineTuneEQEngine::FineTuneEQEngine(double sampleRate) {
 
 FineTuneEQEngine::~FineTuneEQEngine() {
     delete pImpl;
+}
+
+void FineTuneEQEngine::updateConfig(const Eq20BandInput& input) {
+    updateConfig(makeEqEngineConfig(input));
 }
 
 void FineTuneEQEngine::updateConfig(const EqEngineConfig& config) {

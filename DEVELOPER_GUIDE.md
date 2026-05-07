@@ -1,64 +1,42 @@
-# 🛠️ Android Custom 20-Band EQ 모듈: 개발자 및 포팅 가이드
+# 🛠️ AndroidEQModule Developer Guide
 
-본 가이드는 C++로 작성된 `AndroidEQModule`을 실제 안드로이드 스튜디오(Kotlin/Java) 프로젝트에 완벽하게 결합(Porting)하고, 오디오 파이프라인을 구축하기 위한 A to Z 상세 매뉴얼입니다.
-
----
-
-## 📦 1. 안드로이드 스튜디오 프로젝트로 포팅 (Porting)
-
-### 1.1. C++ 소스 파일 복사
-현재 폴더에 있는 `src/main/cpp/` 내부의 모든 C++ 파일 및 헤더를 안드로이드 스튜디오 프로젝트의 `app/src/main/cpp/` 경로로 복사합니다.
-
-### 1.2. `CMakeLists.txt` 설정 (모듈 연결)
-안드로이드 앱의 `app/src/main/cpp/CMakeLists.txt` 파일을 열어 다음 코드를 추가합니다.
-
-```cmake
-# AndroidEQModule 소스 지정
-add_library(
-    audioengine_jni
-    SHARED
-    BiquadFilter.cpp
-    FineTuneEQEngine.cpp
-    AudioEngineJNI.cpp
-)
-
-# NDK 기본 라이브러리 링크 (log는 디버깅용)
-target_link_libraries(
-    audioengine_jni
-    android
-    log
-)
-```
-
-### 1.3. `build.gradle` NDK 활성화
-`app/build.gradle`의 `android.defaultConfig` 블록에 C++ 표준 및 NEON 가속을 명시합니다.
-
-```groovy
-android {
-    defaultConfig {
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++17 -mfpu=neon"
-            }
-        }
-    }
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt"
-        }
-    }
-}
-```
+본 문서는 `AndroidEQModule`의 현재 JNI 입력 계약과 wrapper 구조 목표를 정리한 개발자 가이드입니다. 범위는 **20-band Parametric EQ core/JNI 연동**에 한정합니다.
 
 ---
 
-## 💻 2. Kotlin 연동 보일러플레이트 (Boilerplate)
+## 1. Scope Boundary
 
-JNI 코드를 호출하기 위해 Kotlin 측에 브릿지 클래스를 생성해야 합니다. 패키지명은 `com.example.audio`로 되어 있으며, 필요 시 JNI C++ 파일의 매크로 이름을 본인의 패키지명에 맞게 변경해야 합니다.
+포함 범위:
 
-### 2.1. JNI Wrapper 클래스 작성 (`AudioEngineJNI.kt`)
+- 20-band Parametric EQ 설정 전달
+- C++ core `EqEngineConfig` 변환
+- JNI `AudioEngineJNI` binding
+- Direct `ByteBuffer` 기반 Float32 stereo PCM in-place 처리
+- `computeAutoPreampDB()` 기반 권장 preamp 계산
 
-> ⚠️ **클래스명은 반드시 `AudioEngineJNI`로 일치시켜야 합니다.** C++ JNI 심볼이 `Java_com_example_audio_AudioEngineJNI_*` 형태로 export되어 있어, 클래스명이 다르면 `UnsatisfiedLinkError`가 발생합니다. 다른 이름을 쓰려면 빌드 시 `-DEQ_JNI_CLASS_PATH='"com/your/pkg/YourClass"'`를 주거나 C 심볼을 모두 변경해야 합니다.
+범위 밖:
+
+- Linear-phase EQ 구현
+- Dynamic EQ 구현
+- Oboe player 구현
+- Android UI/slider 화면 구현
+
+Linear-phase/Dynamic EQ는 Parametric EQ와의 비교 또는 제외 범위 설명에만 사용할 수 있습니다. 이 문서에서는 추가 구현 계획으로 다루지 않습니다.
+
+---
+
+## 2. Current Kotlin/JNI Contract
+
+현재 기본 입력은 다음 4개 20-band 배열입니다.
+
+```text
+gains[20]
+qFactors[20]
+frequencies[20]
+filterTypes[20]
+```
+
+Kotlin wrapper는 기본 class path 기준으로 다음처럼 둡니다.
 
 ```kotlin
 package com.example.audio
@@ -66,112 +44,154 @@ package com.example.audio
 import java.nio.ByteBuffer
 
 class AudioEngineJNI {
-    // C++ 라이브러리 로드
-    init {
-        System.loadLibrary("audioengine_jni")
-    }
+    init { System.loadLibrary("audioengine_jni") }
 
-    // C++ 내부 메모리 할당
     external fun init(sampleRate: Int)
-    
-    // 메모리 해제
     external fun release()
 
-    // 20밴드 EQ 업데이트 (Preamp, Limiter 포함)
     external fun updateConfig(
         preampDB: Float,
         enableLimiter: Boolean,
-        filterTypes: IntArray, // 0=PEAKING, 1=LOW_SHELF, 2=HIGH_SHELF
-        frequencies: FloatArray,
-        gains: FloatArray,
-        qFactors: FloatArray
+        filterTypes: IntArray,    // 0=PEAKING, 1=LOW_SHELF, 2=HIGH_SHELF
+        frequencies: FloatArray,  // Hz
+        gains: FloatArray,        // dB
+        qFactors: FloatArray      // Q
     )
 
-    // 핵심: Direct ByteBuffer를 C++로 던져 In-place 처리
     external fun processDirectBuffer(buffer: ByteBuffer, numFrames: Int)
+    external fun computeAutoPreampDB(): Float
 }
 ```
 
-### 2.2. 오디오 스트리밍 루프 및 Direct ByteBuffer 할당
+주의:
 
-PCM을 디코더에서 꺼내어 `AudioTrack`으로 보낼 때 징검다리 역할을 하는 핵심 루프입니다.
+- JNI signature는 `(FZ[I[F[F[F)V`입니다.
+- 배열 길이는 최대 20개로 취급합니다.
+- 20개보다 적은 입력은 나머지 band를 flat/bypass로 다루는 방향이어야 합니다.
+- `filterTypes` 값은 `0=PEAKING`, `1=LOW_SHELF`, `2=HIGH_SHELF` Parametric EQ 범위 안에서만 사용합니다.
 
-```kotlin
-import android.media.AudioFormat
-import android.media.AudioTrack
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+---
 
-fun startAudioProcessingLoop() {
-    val sampleRate = 48000
-    val channels = 2 // 스테레오
-    
-    // 1. C++ 엔진 초기화
-    val engine = AudioEngineJNI()
-    engine.init(sampleRate)
+## 3. Wrapper Input Structure Target
 
-    // 2. 초기 20밴드 설정 주입 (플랫 + 리미터 On)
-    val dummyArray = FloatArray(20) { 0f }
-    val typesArray = IntArray(20) { 0 }
-    engine.updateConfig(0f, true, typesArray, dummyArray, dummyArray, dummyArray)
+새 wrapper 입력 구조의 목표는 Kotlin/UI 계층에서 온 고정 배열 값을 core config로 변환하는 adapter contract를 명확히 하는 것입니다.
 
-    // 3. AudioTrack 설정 (반드시 ENCODING_PCM_FLOAT 사용!)
-    val audioTrack = AudioTrack.Builder()
-        .setAudioFormat(AudioFormat.Builder()
-            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-            .setSampleRate(sampleRate)
-            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-            .build())
-        .build()
+```text
+gainMin: Float
+gainMax: Float
+gains[20]: FloatArray
 
-    // 4. Direct ByteBuffer 생성 (JNI Zero-copy의 핵심)
-    // 1프레임 = 2채널(L/R) * 4바이트(Float) = 8바이트. (예: 1024 프레임 버퍼)
-    val numFrames = 1024
-    val byteBufferSize = numFrames * 2 * 4 
-    val directBuffer = ByteBuffer.allocateDirect(byteBufferSize)
-        .order(ByteOrder.nativeOrder())
+qMin: Float
+qMax: Float
+qFactors[20]: FloatArray
 
-    // 5. 오디오 스레드 권한 격상 (필수)
-    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+frequencies[20]: FloatArray
+filterTypes[20]: IntArray 또는 EqFilterType[20]
+```
 
-    audioTrack.play()
+정책:
 
-    // 6. 실시간 처리 루프
-    while (isPlaying) {
-        // [A] 디코더에서 PCM 데이터(Float)를 가져와 directBuffer에 기록 (구현 생략)
-        fillBufferFromDecoder(directBuffer)
+- `gainMin/gainMax`는 `gains[20]`를 clamp하는 core adapter bound입니다.
+- `qMin/qMax`는 `qFactors[20]`를 clamp하는 core adapter bound입니다.
+- min/max는 UI slider 제한이 아닙니다. UI가 어떤 범위를 표시하든 core adapter는 자체 clamp 정책을 가져야 합니다.
+- wrapper는 기존 `EqEngineConfig`/`EqBandConfig`로 변환되는 입력 계층입니다.
+- wrapper 구조는 Parametric EQ 전용입니다. Linear-phase/Dynamic EQ 확장을 전제로 필드를 추가하지 않습니다.
 
-        // [B] C++ EQ 엔진 통과 (In-place 연산: directBuffer 내부의 값이 EQ가 먹힌 소리로 변함)
-        engine.processDirectBuffer(directBuffer, numFrames)
+예상 변환 흐름:
 
-        // [C] 처리된 버퍼를 AudioTrack으로 출력
-        directBuffer.position(0)
-        audioTrack.write(directBuffer, byteBufferSize, AudioTrack.WRITE_BLOCKING)
-    }
-
-    engine.release()
-}
+```text
+Wrapper fixed arrays
+  → clamp gains by gainMin/gainMax
+  → clamp qFactors by qMin/qMax
+  → pair with frequencies/filterTypes
+  → EqBandConfig[0..20]
+  → EqEngineConfig
+  → FineTuneEQEngine.updateConfig(...)
 ```
 
 ---
 
-## 🚦 3. 개발자 핵심 팁 및 트러블슈팅 (Troubleshooting)
+## 4. Preamp Policy
 
-### Q1. 소리가 심하게 찢어집니다 (Clipping/Distortion)
-가장 흔하게 발생하는 문제입니다.
-1. `AudioTrack`을 **`ENCODING_PCM_FLOAT`**로 설정하셨는지 확인하세요. 16-bit Short로 보내면 소리가 깨집니다.
-2. 디코더에서 나온 데이터가 16-bit라면 Kotlin 루프 내에서 `-32768 ~ 32767` 값을 `-1.0f ~ 1.0f`로 나누어 Float 변환한 뒤 `directBuffer`에 넣어야 합니다.
-3. **Preamp 누락 여부:** +5dB로 부스트된 슬라이더가 있다면, Kotlin에서 `engine.updateConfig`를 호출할 때 반드시 `preampDB` 인자로 `-5.0f`를 넘겨주었는지 확인하세요. (자동 감쇠 누락 시 리미터가 과도하게 걸립니다)
+Preamp는 “가장 큰 band gain이 +5 dB이므로 -5 dB를 넣는다” 같은 단순 규칙으로 설명하지 않습니다.
 
-### Q2. EQ 파라미터(슬라이더)를 바꿀 때마다 틱(Click)/팝(Pop) 노이즈가 납니다
-C++ 엔진 객체(`new FineTuneEQEngine()`)를 매번 새로 생성하시면 안 됩니다!
-오디오가 재생 중일 때 슬라이더를 드래그하면, 백그라운드에서 오디오가 도는 상태 그대로 `engine.updateConfig(...)` 함수만 런타임에 계속 쏴주시면 됩니다. 내부의 Stateful Biquad 필터가 자연스럽게 계수를 전환하며 팝 노이즈를 억제합니다.
+권장 정책:
 
-### Q3. UI 슬라이더를 올렸는데 반응이 느립니다 (Latency)
-버퍼 사이즈(`numFrames`)를 너무 크게 잡아서 그렇습니다. JNI 호출을 아끼려고 8192 프레임(약 170ms) 씩 던지면 소리도 170ms 뒤에 변합니다.
-모바일 최적값은 **480 ~ 1024 프레임(10ms ~ 20ms)** 단위입니다.
+1. `updateConfig(...)`로 band 설정을 반영합니다.
+2. `computeAutoPreampDB()`를 호출합니다.
+3. 반환된 값을 `preampDB`로 다시 적용합니다.
 
-### Q4. 패키지명을 바꾸고 싶어요
-`AudioEngineJNI.cpp` 내부의 함수명을 유심히 보십시오.
-`Java_com_example_audio_AudioEngineJNI_init` 은 `com.example.audio` 패키지의 `AudioEngineJNI` 클래스에 바인딩된다는 JNI 규격입니다.
-만약 본인의 프로젝트 패키지가 `com.mycompany.music`이고 코틀린 클래스가 `EqCore` 라면, C++ 함수명들을 모두 `Java_com_mycompany_music_EqCore_init`으로 변경한 후 빌드하셔야 `UnsatisfiedLinkError`가 나지 않습니다.
+`computeAutoPreampDB()`는 개별 band gain의 최대값이 아니라, 20-band cascade의 **누적 주파수 응답 peak**를 기준으로 권장 감쇠량을 계산합니다. 여러 band가 겹쳐 실제 peak가 커지는 경우를 반영할 수 있으며, 순수 감쇠 preset에서는 0 dB를 반환할 수 있습니다.
+
+---
+
+## 5. JNI Class Path and RegisterNatives
+
+C++ bridge는 `JNI_OnLoad`에서 `RegisterNatives`를 사용합니다.
+
+- 기본 class path: `com/example/audio/AudioEngineJNI`
+- Kotlin 기본 클래스: `com.example.audio.AudioEngineJNI`
+- build-time override: `-DEQ_JNI_CLASS_PATH=\"com/your/pkg/YourClass\"`
+
+권장 방식:
+
+```groovy
+android {
+    defaultConfig {
+        externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++17 -DEQ_JNI_CLASS_PATH="com/your/pkg/YourClass"'
+            }
+        }
+    }
+}
+```
+
+충돌 방지 원칙:
+
+- Kotlin 클래스 경로와 `EQ_JNI_CLASS_PATH`를 동일하게 유지합니다.
+- 메서드 이름/signature는 `RegisterNatives` 테이블과 맞춥니다.
+- 기본으로 export된 `Java_com_example_audio_AudioEngineJNI_*` C symbol은 fallback 호환용으로 이해합니다.
+- 커스텀 패키지/클래스에서는 C symbol 이름을 직접 의존하지 말고 `RegisterNatives` + `EQ_JNI_CLASS_PATH` 기준으로 맞춥니다.
+
+---
+
+## 6. Build and Verification Notes
+
+Android NDK build 예시:
+
+```bash
+NDK=/path/to/Android/sdk/ndk/27.0.12077973
+cmake -S src/main/cpp -B build/android-arm64 \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-24 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/android-arm64 -j
+```
+
+Host C++ 검증은 “모든 C++ 환경”이라는 표현을 쓰기 전에 별도 standalone target으로 확인해야 합니다.
+
+- 단순 `clang++ -c`는 컴파일 단위 검증일 뿐입니다.
+- host CMake/standalone executable 또는 test target을 구성해 link와 runtime smoke test까지 확인해야 합니다.
+- JNI/Android 의존 파일은 host target에서 제외하거나 stub 처리해야 합니다.
+
+---
+
+## 7. Troubleshooting
+
+| 증상 | 확인 사항 |
+|---|---|
+| `UnsatisfiedLinkError` | Kotlin class path와 `EQ_JNI_CLASS_PATH` 일치 여부, `System.loadLibrary("audioengine_jni")` 호출 여부 |
+| EQ 적용 후 clipping | `computeAutoPreampDB()` 기반 preamp를 적용했는지 확인 |
+| 설정 변경 시 click/pop | 엔진 재생성 대신 기존 instance에 `updateConfig(...)`만 호출하는지 확인 |
+| 배열 입력 오류 | 4개 배열이 모두 준비되었는지, 20-band cap 정책과 null/길이 검증을 통과하는지 확인 |
+| PCM 처리 실패 | `ByteBuffer.allocateDirect(...)`, native byte order, `numFrames * 2 * sizeof(float)` capacity 확인 |
+
+---
+
+## 8. Documentation Rules for Parallel Work
+
+- 이 문서는 Parametric EQ wrapper/core adapter 범위만 기술합니다.
+- Linear-phase EQ, Dynamic EQ, Oboe player, UI 구현을 roadmap 또는 추가 계획으로 넣지 않습니다.
+- 구현 파일(`src/main/cpp/*`)과 개발 계획 파일(`dev-plan/*`)은 이 문서 동기화 작업의 수정 대상이 아닙니다.
